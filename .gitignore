@@ -1,0 +1,49 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+.serverless/
+.DS_Store
+
+# Enviroment & Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project Specific
+honeypot/backend/venv/
+honeypot/frontend/node_modules/
+data/
+logs/
+temp/
+*.log

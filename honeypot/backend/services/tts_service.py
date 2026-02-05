@@ -1,0 +1,251 @@
+"""
+Text-to-Speech Service using Piper TTS
+Generates natural-sounding voice from text
+"""
+
+import os
+import logging
+import subprocess
+from pathlib import Path
+from typing import Optional, Dict
+import hashlib
+
+try:
+    import pyttsx3  # Fallback TTS
+    PYTTSX3_AVAILABLE = True
+except ImportError:
+    PYTTSX3_AVAILABLE = False
+
+try:
+    from gtts import gTTS  # High-quality online fallback
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+
+from config import settings
+
+logger = logging.getLogger("tts_service")
+
+class TTSService:
+    """
+    Production-grade Text-to-Speech service
+    """
+    
+    def __init__(self):
+        self.engine_type = getattr(settings, 'TTS_ENGINE', 'system')  # 'piper' or 'system'
+        self.voice_path = Path(getattr(settings, 'TTS_VOICE_PATH', './models/voices'))
+        self.output_path = Path(getattr(settings, 'AUDIO_STORAGE_PATH', './storage/audio')) / 'synthesized'
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Voice mapping for different languages
+        self.voice_map = {
+            'en': 'en_US-lessac-medium',  # English (US)
+            'hi': 'hi_IN-medium',          # Hindi
+            'ta': 'ta_IN-medium',          # Tamil
+            'te': 'te_IN-medium',          # Telugu
+            'ml': 'ml_IN-medium',          # Malayalam
+            'bn': 'bn_IN-medium',          # Bengali
+        }
+        
+        self._pyttsx3_engine = None
+        self._initialized = False
+    
+    def initialize(self):
+        """
+        Initialize TTS engine (lazy loading)
+        """
+        if self._initialized:
+            return
+            
+        if self.engine_type == 'system' and PYTTSX3_AVAILABLE:
+            try:
+                self._pyttsx3_engine = pyttsx3.init()
+                # Configure voice properties
+                self._pyttsx3_engine.setProperty('rate', 150)  # Speed
+                self._pyttsx3_engine.setProperty('volume', 0.9)  # Volume
+                self._initialized = True
+                logger.info("✅ System TTS (pyttsx3) initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize pyttsx3: {e}")
+        
+        self._initialized = True
+    
+    def synthesize(
+        self,
+        text: str,
+        language: str = "en",
+        session_id: Optional[str] = None
+    ) -> Dict[str, any]:
+        """
+        Synthesize speech from text
+        
+        Args:
+            text: Text to synthesize
+            language: Language code
+            session_id: Optional session ID for file organization
+            
+        Returns:
+            {
+                "audio_path": str,
+                "duration": float,
+                "format": str,
+                "language": str
+            }
+        """
+        if not self._initialized:
+            self.initialize()
+        
+        try:
+            # Generate unique filename
+            text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+            filename = f"tts_{language}_{text_hash}.wav"
+            
+            if session_id:
+                output_dir = self.output_path / session_id
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_file = output_dir / filename
+            else:
+                output_file = self.output_path / filename
+            
+            # Try Piper first (if available)
+            if self.engine_type == 'piper':
+                success = self._synthesize_piper(text, str(output_file), language)
+                if success:
+                    return self._build_result(str(output_file), language)
+            
+            # Fallback to gTTS (Higher quality online fallback)
+            if GTTS_AVAILABLE:
+                success = self._synthesize_gtts(text, str(output_file), language)
+                if success:
+                    return self._build_result(str(output_file), language)
+
+            # Fallback to system TTS
+            if self._pyttsx3_engine:
+                self._synthesize_system(text, str(output_file))
+                return self._build_result(str(output_file), language)
+            
+            # If all fails, return error
+            logger.error("No TTS engine available")
+            return self._fallback_synthesis()
+            
+        except Exception as e:
+            logger.error(f"TTS synthesis failed: {e}", exc_info=True)
+            return self._fallback_synthesis()
+    
+    def _synthesize_piper(self, text: str, output_file: str, language: str) -> bool:
+        """
+        Synthesize using Piper TTS (subprocess call)
+        """
+        try:
+            voice_model = self.voice_map.get(language, self.voice_map['en'])
+            voice_file = self.voice_path / f"{voice_model}.onnx"
+            
+            if not voice_file.exists():
+                logger.warning(f"Piper voice model not found: {voice_file}")
+                return False
+            
+            # Call piper CLI
+            cmd = [
+                "piper",
+                "--model", str(voice_file),
+                "--output_file", output_file
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                input=text.encode('utf-8'),
+                capture_output=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0 and os.path.exists(output_file):
+                logger.info(f"Piper synthesis successful: {output_file}")
+                return True
+            else:
+                logger.error(f"Piper synthesis failed: {result.stderr.decode()}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.error("Piper synthesis timeout")
+            return False
+        except FileNotFoundError:
+            logger.warning("Piper CLI not found. Install: pip install piper-tts")
+            return False
+        except Exception as e:
+            logger.error(f"Piper synthesis error: {e}")
+            return False
+    
+    def _synthesize_gtts(self, text: str, output_file: str, language: str) -> bool:
+        """
+        Synthesize using gTTS (Google TTS)
+        """
+        try:
+            # gTTS supports ISO codes (hi, ta, te, ml)
+            tts = gTTS(text=text, lang=language)
+            tts.save(output_file)
+            logger.info(f"gTTS synthesis successful: {output_file}")
+            return True
+        except Exception as e:
+            logger.error(f"gTTS synthesis failed: {e}")
+            return False
+
+    def _synthesize_system(self, text: str, output_file: str):
+        """
+        Synthesize using system TTS (pyttsx3)
+        """
+        try:
+            self._pyttsx3_engine.save_to_file(text, output_file)
+            self._pyttsx3_engine.runAndWait()
+            logger.info(f"System TTS synthesis successful: {output_file}")
+        except Exception as e:
+            logger.error(f"System TTS synthesis failed: {e}")
+            raise
+    
+    def _build_result(self, audio_path: str, language: str) -> Dict[str, any]:
+        """
+        Build synthesis result dictionary
+        """
+        # Get audio duration (approximate)
+        duration = self._estimate_duration(audio_path)
+        
+        return {
+            "audio_path": audio_path,
+            "duration": duration,
+            "format": "wav",
+            "language": language
+        }
+    
+    def _estimate_duration(self, audio_path: str) -> float:
+        """
+        Estimate audio duration
+        """
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_wav(audio_path)
+            return audio.duration_seconds
+        except Exception:
+            # Rough estimate: ~150 words per minute, ~5 chars per word
+            # Just return 0 if we can't measure
+            return 0.0
+    
+    def _fallback_synthesis(self) -> Dict[str, any]:
+        """
+        Fallback when TTS unavailable
+        """
+        return {
+            "audio_path": None,
+            "duration": 0.0,
+            "format": "wav",
+            "language": "en",
+            "error": "TTS service unavailable"
+        }
+    
+    def get_supported_languages(self) -> list:
+        """
+        Get list of supported languages
+        """
+        return list(self.voice_map.keys())
+
+
+# Singleton instance
+tts_service = TTSService()

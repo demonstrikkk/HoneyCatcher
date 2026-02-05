@@ -1,0 +1,12 @@
+{
+    "sessionId": "test-123",
+    "message": {
+        "sender": "scammer",
+        "text": "Your bank account will be blocked",
+        "timestamp": 1234567890
+    },
+    "conversationHistory": [],
+    "metadata": {
+        "channel": "test"
+    }
+}
