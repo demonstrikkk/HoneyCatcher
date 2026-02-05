@@ -1,10 +1,10 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchSession } from '../services/api';
-import Navbar from '../components/Navbar';
-import GlassCard from '../components/GlassCard';
-import MessageBubble from '../components/MessageBubble';
-import IntelligencePanel from '../components/IntelligencePanel';
+import { fetchSession } from '../services/api.js';
+import Navbar from '../components/Navbar.jsx';
+import GlassCard from '../components/GlassCard.jsx';
+import MessageBubble from '../components/MessageBubble.jsx';
+import IntelligencePanel from '../components/IntelligencePanel.jsx';
 import { AlertTriangle, Lock } from 'lucide-react';
 
 const SessionView = () => {

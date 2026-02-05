@@ -1,11 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertCircle, Clock, ChevronRight } from 'lucide-react';
-import Navbar from '@/components/Navbar.jsx';
-import GlassCard from '@/components/GlassCard.jsx';
-import { fetchSessions } from '@/services/api.js';
-import { cn } from '@/lib/utils.js';
-import DashboardFilters from '../components/DashboardFilters';
+import Navbar from '../components/Navbar.jsx';
+import GlassCard from '../components/GlassCard.jsx';
+import { fetchSessions } from '../services/api.js';
+import { cn } from '../lib/utils.js';
+import DashboardFilters from '../components/DashboardFilters.jsx';
 import { Volume2, MessageSquare, Globe } from 'lucide-react';
 
 // Helper for safe date formatting
