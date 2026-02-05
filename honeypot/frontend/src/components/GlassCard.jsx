@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { cn } from '@/lib/utils.js';
+import { cn } from '../utils.js';
 
 const GlassCard = ({ children, className, delay = 0 }) => {
     return (
