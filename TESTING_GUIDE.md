@@ -1,8 +1,32 @@
-# HoneyBadger Testing Guide
+# 🦡 HoneyBadger Testing Guide - COMPREHENSIVE v2.0
 
-## Complete Testing Workflow for Audio Transcription & Intelligence Extraction
+## Complete Testing Workflow with Logging Timeline
 
-This guide provides step-by-step instructions for testing all major features of the HoneyBadger honeypot system.
+**✅ NOW INCLUDES:**
+- Operator-only audio capture
+- Comprehensive debug logging with emojis
+- VirusTotal test UI button
+- Complete audio→transcription→intelligence pipeline
+- Error handling with user feedback
+
+---
+
+## 📋 Quick Start (1 minute)
+
+```bash
+# Terminal 1: Backend
+cd honeypot/backend && python main.py
+
+# Terminal 2: Frontend  
+cd honeypot/frontend && npm run dev
+
+# Open browser to:
+# http://localhost:5173 → Create Live Call
+# Two windows: ?role=operator and ?role=scammer
+# Operator: Speak to get transcriptions
+# Scammer: Auto-disabled (operator-only mode)
+# Click "Test VT" button in operator panel
+```
 
 ---
 

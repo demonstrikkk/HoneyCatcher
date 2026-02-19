@@ -463,6 +463,12 @@ class WebRTCService {
    * This runs IN PARALLEL with the P2P WebRTC stream
    */
   _startLocalAudioCapture() {
+    // Only operator can capture and send audio (realistic deployment)
+    if (this.role !== 'operator') {
+      console.log(`ℹ️ ${this.role} audio capture disabled (operator-only mode)`);
+      return;
+    }
+    
     if (this._localMediaRecorder) {
       console.log(`⚠️ ${this.role} local audio capture already active`);
       return;
@@ -501,17 +507,28 @@ class WebRTCService {
           const reader = new FileReader();
           reader.onloadend = () => {
             const base64 = reader.result.split(',')[1];
-            console.log(`🎤 ${this.role} sending audio chunk: ${event.data.size} bytes`);
+            console.log(`🎤 ${this.role} SENDING chunk: ${event.data.size} bytes to backend`);
+            console.log(`   📍 Socket ID: ${this.socket.id}`);
+            console.log(`   🔗 Room: ${this.roomId}`);
+            console.log(`   ⏱️ Timestamp: ${new Date().toISOString()}`);
+            
             this.socket.emit('transcription_chunk', {
               audio: base64,
               format: 'webm',
               speaker: this.role || 'operator',
               room_id: this.roomId
+            }, (ack) => {
+              console.log(`✅ ${this.role} chunk ACK received from server`);
             });
           };
           reader.readAsDataURL(event.data);
         } else {
-          console.warn(`⚠️ ${this.role} skipped empty chunk or socket disconnected`);
+          if (!this.socket?.connected) {
+            console.warn(`⚠️ ${this.role} skipped chunk: socket disconnected`);
+          }
+          if (!(event.data.size > 0)) {
+            console.warn(`⚠️ ${this.role} skipped empty chunk`);
+          }
         }
       };
       

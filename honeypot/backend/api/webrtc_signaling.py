@@ -260,6 +260,9 @@ async def transcription_chunk(sid, data):
     """
     room_id = data.get('room_id') or room_manager.sid_to_room.get(sid)
     speaker = data.get('speaker', 'unknown')
+    audio_size = len(data.get('audio', '')) // 1024  # Rough KB estimate
+    
+    logger.info(f"📥 RECEIVED audio chunk from {speaker}: ~{audio_size}KB, room={room_id}, socket_id={sid}")
     
     if not room_id:
         logger.warning(f"⚠️ Received audio chunk from {speaker} but no room_id found")
@@ -270,7 +273,7 @@ async def transcription_chunk(sid, data):
         logger.warning(f"⚠️ Received audio chunk from {speaker} but room {room_id} not found")
         return
     
-    logger.debug(f"📥 Received audio chunk from {speaker} in room {room_id}")
+    logger.debug(f"✅ Room {room_id} found, queuing for transcription...")
     
     # Process transcription in background
     asyncio.create_task(process_transcription(room, data))
@@ -291,14 +294,14 @@ async def process_transcription(room: WebRTCRoom, data: dict):
         
         # Decode audio
         audio_bytes = base64.b64decode(audio_base64)
-        logger.debug(f"🎵 {speaker}: Processing {len(audio_bytes)} bytes ({audio_format})")
+        logger.info(f"🎵 {speaker}: DECODED {len(audio_bytes)} bytes ({audio_format}) from base64")
         
         # Normalize audio chunk to WAV (required by Whisper)
         normalized = room.normalizer.normalize_chunk(audio_bytes, source_format=audio_format)
         
         # Skip if normalization failed (common for incomplete streaming chunks)
         if normalized is None:
-            logger.debug(f"⚠️ {speaker}: Normalization failed (incomplete chunk)")
+            logger.warning(f"⚠️ {speaker}: Normalization FAILED (incomplete or silent chunk)")
             return
         
         # Get appropriate transcriber
@@ -306,11 +309,11 @@ async def process_transcription(room: WebRTCRoom, data: dict):
         
         # Add chunk and check if ready
         chunk_size_kb = len(normalized) / 1024
-        logger.debug(f"📊 {speaker}: Added {chunk_size_kb:.1f}KB normalized audio")
+        logger.info(f"📊 {speaker}: NORMALIZED to {chunk_size_kb:.1f}KB WAV, adding to transcriber buffer...")
         is_ready = transcriber.add_chunk(normalized)
         
         if is_ready:
-            logger.info(f"🎙️ {speaker}: Buffer ready, starting transcription...")
+            logger.info(f"🎙️ {speaker}: Buffer ready ({len(normalized)} bytes), STARTING TRANSCRIPTION...")
             result = await transcriber.transcribe_buffer()
             
             if result and result.get("text"):
@@ -318,7 +321,7 @@ async def process_transcription(room: WebRTCRoom, data: dict):
                 
                 # Skip empty or very short transcriptions
                 if not text or len(text) < 2:
-                    logger.debug(f"⚠️ {speaker}: Skipping empty transcription")
+                    logger.warning(f"⚠️ {speaker}: Skipping empty transcription result")
                     return
                 
                 language = result.get("language", "en")
@@ -326,7 +329,8 @@ async def process_transcription(room: WebRTCRoom, data: dict):
                 
                 # Log language detection
                 lang_name = "English" if language == "en" else "Hindi" if language == "hi" else language
-                logger.info(f"✅ {speaker}: Transcribed in {lang_name} (confidence: {confidence:.2f})")
+                logger.info(f"✅ {speaker}: TRANSCRIBED in {lang_name} (confidence: {confidence:.2f})")
+                logger.info(f"💬 {speaker} said: \"{text[:100]}{'...' if len(text) > 100 else ''}\"")
                 
                 transcription = {
                     "speaker": speaker,
@@ -338,27 +342,36 @@ async def process_transcription(room: WebRTCRoom, data: dict):
                 
                 # Add to transcript
                 room.transcript.append(transcription)
-                logger.info(f"📝 {speaker}: '{text[:80]}{'...' if len(text) > 80 else ''}'")
+                logger.info(f"📝 Added to room transcript (total: {len(room.transcript)} messages)")
                 
                 # Send transcription to BOTH operator and scammer
                 # (Each can see what they and the other person said)
                 await sio.emit('transcription', transcription, room=room.room_id)
-                logger.info(f"📤 Sent transcription to room {room.room_id}")
+                logger.info(f"📤 EMITTED transcription to room {room.room_id}")
                 
                 # Save to database
-                await db.live_calls.update_one(
-                    {"call_id": room.room_id},
-                    {"$push": {"transcript": transcription}},
-                    upsert=True
-                )
+                try:
+                    await db.live_calls.update_one(
+                        {"call_id": room.room_id},
+                        {"$push": {"transcript": transcription}},
+                        upsert=True
+                    )
+                    logger.info(f"💾 Saved transcription to MongoDB")
+                except Exception as db_err:
+                    logger.error(f"❌ Failed to save to DB: {db_err}")
                 
                 # If scammer speaking, extract intelligence and provide AI coaching
                 if speaker == "scammer" and room.operator_sid:
+                    logger.info(f"🧠 Queuing intelligence extraction for scammer speech...")
                     asyncio.create_task(extract_intelligence(room, result["text"]))
                     asyncio.create_task(provide_ai_coaching(room))
+            else:
+                logger.warning(f"⚠️ {speaker}: Transcription returned no text")
+        else:
+            logger.debug(f"⏳ {speaker}: Buffer has more audio needed (not ready yet)")
     
     except Exception as e:
-        logger.error(f"❌ Transcription error for {data.get('speaker', 'unknown')}: {e}", exc_info=True)
+        logger.error(f"❌ TRANSCRIPTION FAILED for {data.get('speaker', 'unknown')}: {e}", exc_info=True)
 
 
 async def extract_intelligence(room: WebRTCRoom, text: str):
