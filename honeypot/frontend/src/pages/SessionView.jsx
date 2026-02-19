@@ -64,7 +64,10 @@ const SessionView = () => {
 
                 {/* Intelligence Column */}
                 <div className="w-[400px]">
-                    <IntelligencePanel intelligence={session.extracted_intelligence} />
+                    <IntelligencePanel 
+                        intelligence={session.extracted_intelligence} 
+                        enableTesting={true}
+                    />
                 </div>
             </div>
         </div>

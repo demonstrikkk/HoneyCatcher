@@ -13,7 +13,7 @@ from db.mongo import MongoDB
 # Import routers (will be created in next stages)
 from api import message, sessions, voice
 from api import live_takeover, voice_clone, live_call, webrtc_signaling
-from api import auth_routes
+from api import auth_routes, testing
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +81,7 @@ app.include_router(live_takeover.router, prefix="/api", tags=["Live Takeover"])
 app.include_router(voice_clone.router, prefix="/api", tags=["Voice Clone"])
 app.include_router(live_call.router, prefix="/api", tags=["Live Call"])
 app.include_router(webrtc_signaling.router, prefix="/api", tags=["WebRTC Signaling"])
+app.include_router(testing.router, prefix="/api", tags=["Testing"])
 
 # Mount Socket.IO for WebRTC signaling
 app.mount("/socket.io", webrtc_signaling.sio_app)

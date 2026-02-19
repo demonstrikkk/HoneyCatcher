@@ -365,6 +365,9 @@ async def extract_intelligence(room: WebRTCRoom, text: str):
     """Extract intelligence from scammer's speech during WebRTC call."""
     try:
         from features.live_takeover.intelligence_pipeline import intelligence_pipeline
+        from features.live_takeover.url_scanner import url_scanner
+        
+        logger.info(f"🧠 Extracting intelligence from: '{text[:100]}...'")
         
         intel_result = await intelligence_pipeline.process_transcript(
             session_id=room.room_id,
@@ -379,8 +382,17 @@ async def extract_intelligence(room: WebRTCRoom, text: str):
             threat_level = intel_result.get("threat_level", 0.0)
             room.threat_level = threat_level
             
+            logger.info(f"✅ Extracted {len(new_entities)} entities, threat level: {threat_level:.2f}")
+            
             if intel_result.get("tactics"):
                 room.tactics.extend(intel_result["tactics"])
+                logger.info(f"🎯 Detected tactics: {', '.join(intel_result.get('tactics', []))}")
+            
+            # Scan URLs if any
+            urls_to_scan = intel_result.get("urls_to_scan", [])
+            if urls_to_scan:
+                logger.info(f"🔗 Scanning {len(urls_to_scan)} URLs with VirusTotal...")
+                asyncio.create_task(scan_urls_and_notify(room, urls_to_scan))
             
             # Send intelligence update to operator
             if room.operator_sid:
@@ -390,6 +402,7 @@ async def extract_intelligence(room: WebRTCRoom, text: str):
                     "tactics": intel_result.get("tactics", []),
                     "timestamp": datetime.utcnow().isoformat()
                 }, room=room.operator_sid)
+                logger.info(f"📤 Sent intelligence update to operator")
             
             # Update database
             await db.live_calls.update_one(
@@ -403,7 +416,37 @@ async def extract_intelligence(room: WebRTCRoom, text: str):
                 }
             )
     except Exception as e:
-        logger.error(f"Intelligence extraction error: {e}", exc_info=True)
+        logger.error(f"❌ Intelligence extraction error: {e}", exc_info=True)
+
+
+async def scan_urls_and_notify(room: WebRTCRoom, urls: list):
+    """Scan URLs with VirusTotal and notify operator of results."""
+    try:
+        from features.live_takeover.url_scanner import url_scanner
+        
+        logger.info(f"🔍 Starting URL scan for {len(urls)} URLs: {urls}")
+        
+        results = await url_scanner.scan_urls(urls)
+        
+        for result in results:
+            logger.info(f"🔎 URL Scan Result: {result.url} - {'MALICIOUS' if not result.is_safe else 'SAFE'} (risk: {result.risk_score:.2f})")
+            
+            # Send to operator
+            if room.operator_sid:
+                await sio.emit('url_scan_result', {
+                    "url": result.url,
+                    "is_safe": result.is_safe,
+                    "risk_score": result.risk_score,
+                    "findings": result.findings,
+                    "scanners": result.scanner_results,
+                    "timestamp": datetime.utcnow().isoformat()
+                }, room=room.operator_sid)
+                logger.info(f"📤 Sent URL scan result to operator for {result.url}")
+        
+        logger.info(f"✅ Completed scanning {len(results)} URLs")
+        
+    except Exception as e:
+        logger.error(f"❌ URL scanning error: {e}", exc_info=True)
 
 
 async def provide_ai_coaching(room: WebRTCRoom):
