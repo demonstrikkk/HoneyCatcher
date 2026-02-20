@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # Live Takeover - ElevenLabs Voice Cloning
     ELEVENLABS_API_KEY: str = ""
     ELEVENLABS_MODEL: str = "eleven_turbo_v2_5"
+    ELEVENLABS_DEFAULT_VOICE: str = "Rachel"  # Default voice for AI responses
+    ELEVENLABS_VOICE_ID: str = "21m00Tcm4TlvDq8ikWAM"  # Rachel voice ID
+    
+    # Audio Storage
+    AUDIO_STORAGE_PATH: str = "./storage/audio"
     
     # URL Scanning
     VIRUSTOTAL_API_KEY: str = ""

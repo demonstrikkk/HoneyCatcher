@@ -20,6 +20,7 @@ from features.live_takeover.intelligence_pipeline import intelligence_pipeline
 from features.live_takeover.report_generator import report_generator
 from features.live_takeover.streaming_stt import StreamingTranscriber, AudioNormalizer
 from features.live_takeover.takeover_agent import takeover_agent
+from services.elevenlabs_service import elevenlabs_service
 
 router = APIRouter()
 logger = logging.getLogger("api.live_call")
@@ -582,6 +583,7 @@ async def extract_intelligence(call_id: str, text: str, session: CallSession):
 async def provide_ai_coaching(call_id: str, session: CallSession):
     """
     Provide AI coaching suggestions to operator based on conversation context.
+    Also generates AI voice response using ElevenLabs if needed.
     """
     try:
         # Get recent conversation context
@@ -601,11 +603,42 @@ async def provide_ai_coaching(call_id: str, session: CallSession):
             tactics=session.tactics
         )
         
+        # Optionally generate AI voice for recommended response
+        audio_data = None
+        if coaching.get("recommended_response"):
+            try:
+                # Use ElevenLabs to synthesize the AI response
+                voice_name = getattr(settings, 'ELEVENLABS_DEFAULT_VOICE', 'Rachel')
+                audio_result = await elevenlabs_service.synthesize(
+                    text=coaching["recommended_response"],
+                    voice_name=voice_name,
+                    session_id=call_id
+                )
+                
+                if audio_result.get("audio_path") and not audio_result.get("error"):
+                    # Read audio file and convert to base64
+                    import base64
+                    from pathlib import Path
+                    audio_path = audio_result["audio_path"]
+                    if Path(audio_path).exists():
+                        with open(audio_path, 'rb') as f:
+                            audio_bytes = f.read()
+                            audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                            audio_data = {
+                                "audio_base64": audio_base64,
+                                "format": "mp3",
+                                "duration": audio_result.get("duration", 0)
+                            }
+                    logger.info(f"✅ Generated AI voice using ElevenLabs ({voice_name})")
+            except Exception as voice_error:
+                logger.warning(f"AI voice generation failed: {voice_error}")
+        
         # Send coaching to operator
         await call_manager.send_to_operator(call_id, {
             "type": "ai_coaching",
             "suggestions": coaching.get("suggestions", []),
             "recommended_response": coaching.get("recommended_response"),
+            "recommended_audio": audio_data,  # Include AI-generated audio
             "warning": coaching.get("warning"),
             "timestamp": datetime.utcnow().isoformat()
         })

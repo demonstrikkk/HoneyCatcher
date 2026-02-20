@@ -45,3 +45,6 @@ redis>=5.0.0
 pydub 
 numpy 
 soundfile
+
+# ElevenLabs TTS
+elevenlabs>=1.0.0

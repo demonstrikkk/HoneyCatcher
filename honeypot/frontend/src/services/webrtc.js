@@ -29,6 +29,12 @@ class WebRTCService {
     this._audioChunkInterval = null;
     this._isCapturing = false;
     
+    // Connection keepalive
+    this._heartbeatInterval = null;
+    this._reconnectAttempts = 0;
+    this._maxReconnectAttempts = 5;
+    this._isReconnecting = false;
+    
     // Callbacks
     this.onRemoteStream = null;
     this.onTranscription = null;
@@ -100,6 +106,9 @@ class WebRTCService {
           
           // Start capturing local audio
           await this.startLocalStream();
+          
+          // Start keepalive heartbeat
+          this._startHeartbeat();
           
           // Create peer connection immediately if peer is already present
           if (!data.waiting_for_peer) {
@@ -225,11 +234,13 @@ class WebRTCService {
       
       this.localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: false,  // Disable for same-device testing
-          noiseSuppression: false,  // Disable for same-device testing
-          autoGainControl: true,
-          sampleRate: 16000,
-          channelCount: 1
+          echoCancellation: true,   // Enable for production (prevents feedback)
+          noiseSuppression: true,   // Enable for production (reduces background noise)
+          autoGainControl: true,     // Normalize volume levels
+          sampleRate: 48000,         // Higher quality audio
+          channelCount: 1,           // Mono for voice
+          latency: 0.01,             // Low latency for real-time
+          volume: 1.0
         },
         video: false
       });
@@ -332,9 +343,21 @@ class WebRTCService {
         this.onConnectionStateChange(state);
       }
       
-      if (state === 'failed' || state === 'disconnected') {
-        console.error('❌ Peer connection failed');
+      if (state === 'connected') {
+        // Reset reconnection counter on successful connection
+        this._reconnectAttempts = 0;
+        console.log('✅ Peer connection established successfully');
+      } else if (state === 'failed') {
+        console.error('❌ Peer connection failed - attempting reconnect');
         this.reconnect();
+      } else if (state === 'disconnected') {
+        console.warn('⚠️ Peer connection disconnected - will attempt reconnect if needed');
+        // Give it a few seconds to recover naturally
+        setTimeout(() => {
+          if (this.peerConnection?.connectionState === 'disconnected') {
+            this.reconnect();
+          }
+        }, 3000);
       }
     };
     
@@ -431,14 +454,75 @@ class WebRTCService {
   }
   
   /**
+   * Start connection keepalive heartbeat
+   */
+  _startHeartbeat() {
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+    }
+    
+    // Send ping every 10 seconds to keep connection alive
+    this._heartbeatInterval = setInterval(() => {
+      if (this.socket?.connected) {
+        this.socket.emit('ping', { room_id: this.roomId });
+        console.log('💓 Heartbeat sent');
+      }
+    }, 10000);
+    
+    console.log('✅ Heartbeat started');
+  }
+  
+  /**
+   * Stop heartbeat
+   */
+  _stopHeartbeat() {
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+      this._heartbeatInterval = null;
+      console.log('⏹️ Heartbeat stopped');
+    }
+  }
+  
+  /**
    * Attempt to reconnect peer connection
    */
   async reconnect() {
-    console.log('🔄 Attempting to reconnect...');
-    this.closePeerConnection();
+    if (this._isReconnecting) {
+      console.log('⚠️ Already reconnecting...');
+      return;
+    }
     
-    if (this.isInitiator) {
-      await this.createOffer();
+    if (this._reconnectAttempts >= this._maxReconnectAttempts) {
+      console.error('❌ Max reconnection attempts reached');
+      if (this.onConnectionStateChange) {
+        this.onConnectionStateChange('failed');
+      }
+      return;
+    }
+    
+    this._isReconnecting = true;
+    this._reconnectAttempts++;
+    
+    console.log(`🔄 Reconnection attempt ${this._reconnectAttempts}/${this._maxReconnectAttempts}...`);
+    
+    try {
+      this.closePeerConnection();
+      
+      // Wait a bit before reconnecting
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Recreate peer connection
+      this.createPeerConnection();
+      
+      if (this.isInitiator) {
+        await this.createOffer();
+      }
+      
+      console.log('✅ Reconnection initiated');
+    } catch (error) {
+      console.error('❌ Reconnection failed:', error);
+    } finally {
+      this._isReconnecting = false;
     }
   }
   
@@ -653,6 +737,9 @@ class WebRTCService {
    */
   disconnect() {
     console.log('🛑 Disconnecting...');
+    
+    // Stop heartbeat
+    this._stopHeartbeat();
     
     // Stop audio capture for transcription
     this._stopAudioCapture();

@@ -1,0 +1,31 @@
+# ngrok Configuration for Multiple Tunnels
+# Place this file as: ngrok.yml in your home directory
+# Windows: C:\Users\<username>\.ngrok2\ngrok.yml
+# Linux/Mac: ~/.ngrok2/ngrok.yml
+
+authtoken: YOUR_NGROK_AUTH_TOKEN_HERE
+
+tunnels:
+  frontend:
+    addr: 5173
+    proto: http
+    host_header: localhost:5173
+    inspect: true
+  
+  backend:
+    addr: 8000
+    proto: http
+    host_header: localhost:8000
+    inspect: true
+  
+  websocket:
+    addr: 8000
+    proto: http
+    host_header: localhost:8000
+    inspect: true
+
+# Usage:
+# ngrok start --all
+# 
+# Or start specific tunnels:
+# ngrok start frontend backend

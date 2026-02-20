@@ -134,6 +134,14 @@ const LiveCall = () => {
               timestamp: data.timestamp
             }]);
           }
+          // Play AI voice if available
+          if (data.recommended_audio) {
+            console.log('🔊 Playing AI voice response from ElevenLabs');
+            await playIncomingAudio(
+              data.recommended_audio.audio_base64, 
+              data.recommended_audio.format || 'mp3'
+            );
+          }
         }
         break;
       
@@ -176,8 +184,9 @@ const LiveCall = () => {
   
   const playIncomingAudio = async (audioBase64, format) => {
     try {
-      // Add to queue
-      audioQueueRef.current.push({ audioBase64, format });
+      // Add to queue with proper format detection
+      const actualFormat = format === 'mp3' ? 'audio/mpeg' : (format === 'wav' ? 'audio/wav' : 'audio/webm');
+      audioQueueRef.current.push({ audioBase64, format, mimeType: actualFormat });
       
       // Start playing if not already playing
       if (!isPlayingRef.current) {
@@ -195,20 +204,17 @@ const LiveCall = () => {
     }
     
     isPlayingRef.current = true;
-    const { audioBase64, format } = audioQueueRef.current.shift();
+    const { audioBase64, format, mimeType } = audioQueueRef.current.shift();
     
     try {
       // Decode base64 to blob with proper MIME type
-      const mimeType = format === 'wav' ? 'audio/wav' : 'audio/webm';
-      const audioBlob = base64ToBlob(audioBase64, mimeType);
+      const audioBlob = base64ToBlob(audioBase64, mimeType || `audio/${format}`);
       const audioUrl = URL.createObjectURL(audioBlob);
       
       // Create audio element and play
       const audio = new Audio(audioUrl);
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-        playNextInQueue(); // Play next in queue
-      };
+      
+      // Add error recovery
       audio.onerror = async (e) => {
         console.error('Audio playback failed, trying Web Audio API fallback...', e);
         URL.revokeObjectURL(audioUrl);
@@ -216,12 +222,27 @@ const LiveCall = () => {
         // Try Web Audio API fallback
         try {
           await playAudioWithWebAudioAPI(audioBlob);
-          playNextInQueue();
+          playNextInQueue(); // Play next
         } catch (fallbackError) {
           console.error('Web Audio API fallback also failed:', fallbackError);
           playNextInQueue(); // Skip and play next
         }
       };
+      
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        playNextInQueue(); // Play next in queue
+      };
+      
+      // Ensure audio context is ready
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      
+      // Resume audio context if suspended (browser autoplay policy)
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
       
       await audio.play();
     } catch (error) {
@@ -261,7 +282,15 @@ const LiveCall = () => {
   
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 48000,
+          channelCount: 1
+        } 
+      });
       
       // Try preferred formats in order (WAV is easier for streaming, WebM as fallback)
       let mimeType = 'audio/webm;codecs=opus';
@@ -308,7 +337,7 @@ const LiveCall = () => {
       
     } catch (error) {
       console.error('Microphone error:', error);
-      alert('Failed to access microphone');
+      alert(`Failed to access microphone: ${error.message}`);
     }
   };
   
