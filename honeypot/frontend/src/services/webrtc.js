@@ -27,6 +27,7 @@ class WebRTCService {
     this._localMediaRecorder = null;
     this._remoteMediaRecorder = null;
     this._audioChunkInterval = null;
+    this._remoteChunkInterval = null;
     this._isCapturing = false;
     
     // Connection keepalive
@@ -407,6 +408,9 @@ class WebRTCService {
         // Reset reconnection counter on successful connection
         this._reconnectAttempts = 0;
         console.log('✅ Peer connection established successfully');
+        
+        // Start capturing local audio for backend transcription (operator only)
+        this._startLocalAudioCapture();
       } else if (state === 'failed') {
         console.error('❌ Peer connection failed - attempting reconnect');
         this.reconnect();
@@ -691,12 +695,28 @@ class WebRTCService {
       
       this._localMediaRecorder.onstop = () => {
         console.log(`🛑 ${this.role} MediaRecorder stopped`);
+        // Restart recording if still capturing (stop/restart cycle for complete blobs)
+        if (this._isCapturing && this.localStream?.active && this._localMediaRecorder) {
+          try {
+            this._localMediaRecorder.start();
+          } catch (e) {
+            console.warn(`⚠️ ${this.role} MediaRecorder restart failed:`, e);
+          }
+        }
       };
       
-      // Send chunks every 5 seconds for continuous automatic transcription
-      this._localMediaRecorder.start(5000);
+      // Use stop/restart cycle instead of timeslice to produce complete WebM blobs
+      // (timeslice mode produces headerless continuation blobs that ffmpeg can't decode)
+      this._localMediaRecorder.start();
       this._isCapturing = true;
-      console.log(`✅ ${this.role} local audio capture active - 5s chunks`);
+      
+      this._audioChunkInterval = setInterval(() => {
+        if (this._localMediaRecorder && this._localMediaRecorder.state === 'recording') {
+          this._localMediaRecorder.stop();
+        }
+      }, 5000);
+      
+      console.log(`✅ ${this.role} local audio capture active - 5s stop/restart cycle`);
       
     } catch (error) {
       console.error(`❌ Failed to start ${this.role} local audio capture:`, error);
@@ -774,9 +794,25 @@ class WebRTCService {
       
       this._remoteMediaRecorder.onstop = () => {
         console.log(`🛑 ${remoteSpeaker} remote MediaRecorder stopped`);
+        // Restart recording if still capturing
+        if (this._isCapturing && this.remoteStream?.active && this._remoteMediaRecorder) {
+          try {
+            this._remoteMediaRecorder.start();
+          } catch (e) {
+            console.warn(`⚠️ ${remoteSpeaker} remote MediaRecorder restart failed:`, e);
+          }
+        }
       };
       
-      this._remoteMediaRecorder.start(5000);
+      // Use stop/restart cycle for complete WebM blobs (same reason as local capture)
+      this._remoteMediaRecorder.start();
+      
+      this._remoteChunkInterval = setInterval(() => {
+        if (this._remoteMediaRecorder && this._remoteMediaRecorder.state === 'recording') {
+          this._remoteMediaRecorder.stop();
+        }
+      }, 5000);
+      
       console.log(`✅ ${this.role} remote audio capture active - hearing ${remoteSpeaker}`);
       
     } catch (error) {
@@ -788,6 +824,19 @@ class WebRTCService {
    * Stop all audio capture
    */
   _stopAudioCapture() {
+    // Stop capturing flag FIRST to prevent onstop handlers from restarting recorders
+    this._isCapturing = false;
+    
+    // Clear chunk interval timers
+    if (this._audioChunkInterval) {
+      clearInterval(this._audioChunkInterval);
+      this._audioChunkInterval = null;
+    }
+    if (this._remoteChunkInterval) {
+      clearInterval(this._remoteChunkInterval);
+      this._remoteChunkInterval = null;
+    }
+    
     if (this._localMediaRecorder && this._localMediaRecorder.state !== 'inactive') {
       try { this._localMediaRecorder.stop(); } catch (e) { /* ignore */ }
       this._localMediaRecorder = null;
@@ -798,7 +847,6 @@ class WebRTCService {
       this._remoteMediaRecorder = null;
     }
     
-    this._isCapturing = false;
     console.log('⏹️ Audio capture stopped');
   }
   
