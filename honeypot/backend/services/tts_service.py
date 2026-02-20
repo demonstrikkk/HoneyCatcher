@@ -204,24 +204,27 @@ class TTSService:
     def _build_result(self, audio_path: str, language: str) -> Dict[str, any]:
         """
         Build synthesis result dictionary.
-        Also uploads the audio to object storage (MinIO) if available.
+        Uploads the audio to Cloudinary and returns the secure URL.
         """
         # Get audio duration (approximate)
         duration = self._estimate_duration(audio_path)
         
-        # Upload to object storage for persistence
-        object_name = audio_path
+        # Upload to Cloudinary for persistent storage
+        audio_url = audio_path  # fallback to local path if upload fails
         try:
-            from services.storage_service import storage
-            rel_path = str(Path(audio_path).relative_to(Path(getattr(settings, 'AUDIO_STORAGE_PATH', './storage/audio'))))
-            object_name = f"synthesized/{rel_path}"
-            storage.upload_file(object_name, audio_path, content_type="audio/wav")
+            from services.cloudinary_service import cloudinary_service, FOLDER_AUDIO_SYNTHESIZED
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_url = cloudinary_service.upload_audio(
+                audio_bytes,
+                Path(audio_path).name,
+                folder=FOLDER_AUDIO_SYNTHESIZED
+            )
         except Exception as e:
-            logger.debug(f"Object storage upload skipped: {e}")
-            object_name = audio_path  # keep local path as fallback
+            logger.error(f"Cloudinary upload failed, using local path: {e}")
         
         return {
-            "audio_path": object_name,
+            "audio_path": audio_url,
             "duration": duration,
             "format": "wav",
             "language": language

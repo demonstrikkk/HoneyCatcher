@@ -268,15 +268,6 @@ class ElevenLabsService:
                     
                     logger.info(f"✅ ElevenLabs synthesis successful: {output_file}")
                     
-                    # Upload to object storage if available
-                    try:
-                        from services.storage_service import storage
-                        rel_path = str(Path(output_file).relative_to(Path(getattr(settings, 'AUDIO_STORAGE_PATH', './storage/audio'))))
-                        object_name = f"synthesized/{rel_path}"
-                        storage.upload_file(object_name, str(output_file), content_type="audio/mpeg")
-                    except Exception as e:
-                        logger.debug(f"Object storage upload skipped: {e}")
-                    
                     return self._build_result(str(output_file), voice_id, voice_name)
                 else:
                     error_msg = response.text
@@ -307,12 +298,26 @@ class ElevenLabsService:
             }
     
     def _build_result(self, audio_path: str, voice_id: str, voice_name: Optional[str]) -> Dict[str, Any]:
-        """Build synthesis result dictionary"""
+        """Build synthesis result dictionary — uploads to Cloudinary."""
         # Get audio duration
         duration = self._estimate_duration(audio_path)
         
+        # Upload to Cloudinary for persistent storage
+        audio_url = audio_path  # fallback
+        try:
+            from services.cloudinary_service import cloudinary_service, FOLDER_AUDIO_SYNTHESIZED
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_url = cloudinary_service.upload_audio(
+                audio_bytes,
+                Path(audio_path).name,
+                folder=FOLDER_AUDIO_SYNTHESIZED
+            )
+        except Exception as e:
+            logger.error(f"Cloudinary upload failed, using local path: {e}")
+        
         return {
-            "audio_path": audio_path,
+            "audio_path": audio_url,
             "duration": duration,
             "format": "mp3",
             "voice_id": voice_id,

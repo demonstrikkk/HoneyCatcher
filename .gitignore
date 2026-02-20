@@ -47,3 +47,4 @@ data/
 logs/
 temp/
 *.log
+honeypot/backend/storage/

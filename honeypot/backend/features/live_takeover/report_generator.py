@@ -237,10 +237,14 @@ class ReportGenerator:
         
         logger.info(f"JSON report generated: {file_path}")
         
+        # Upload to Cloudinary
+        cloudinary_url = self._upload_to_cloudinary(file_path)
+        
         return {
             "report_id": report_id,
             "format": "json",
             "file_path": str(file_path),
+            "cloudinary_url": cloudinary_url,
             "data": data
         }
     
@@ -422,10 +426,14 @@ class ReportGenerator:
         
         logger.info(f"PDF report generated: {file_path}")
         
+        # Upload to Cloudinary
+        cloudinary_url = self._upload_to_cloudinary(file_path)
+        
         return {
             "report_id": report_id,
             "format": "pdf",
             "file_path": str(file_path),
+            "cloudinary_url": cloudinary_url,
             "data": None  # PDF is file-only
         }
     
@@ -517,12 +525,27 @@ class ReportGenerator:
         
         logger.info(f"CSV report generated: {file_path}")
         
+        # Upload to Cloudinary
+        cloudinary_url = self._upload_to_cloudinary(file_path)
+        
         return {
             "report_id": report_id,
             "format": "csv",
             "file_path": str(file_path),
+            "cloudinary_url": cloudinary_url,
             "data": None
         }
+    
+    def _upload_to_cloudinary(self, file_path: Path) -> Optional[str]:
+        """Upload a report file to Cloudinary and return the secure URL."""
+        try:
+            from services.cloudinary_service import cloudinary_service
+            with open(file_path, "rb") as f:
+                data = f.read()
+            return cloudinary_service.upload_report(data, file_path.name)
+        except Exception as e:
+            logger.error(f"Report Cloudinary upload failed: {e}")
+            return None
     
     async def generate_all_formats(self, session_id: str) -> Dict[str, Any]:
         """Generate report in all formats at once."""

@@ -306,16 +306,23 @@ class VoiceCloneService:
         filename_base: str, 
         session_id: Optional[str] = None
     ) -> str:
-        """Save audio bytes to disk."""
-        if session_id:
-            output_dir = CLONE_AUDIO_DIR / session_id
-            output_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            output_dir = CLONE_AUDIO_DIR
-        
-        filepath = output_dir / f"clone_{filename_base}.mp3"
-        filepath.write_bytes(audio_data)
-        return str(filepath)
+        """Upload audio bytes to Cloudinary and return secure URL."""
+        try:
+            from services.cloudinary_service import cloudinary_service, FOLDER_AUDIO_SYNTHESIZED
+            filename = f"clone_{filename_base}.mp3"
+            folder = f"{FOLDER_AUDIO_SYNTHESIZED}/{session_id}" if session_id else FOLDER_AUDIO_SYNTHESIZED
+            return cloudinary_service.upload_audio(audio_data, filename, folder=folder)
+        except Exception as e:
+            logger.error(f"Cloudinary upload failed, falling back to local: {e}")
+            # Fallback: save locally so the call doesn't break
+            if session_id:
+                output_dir = CLONE_AUDIO_DIR / session_id
+                output_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                output_dir = CLONE_AUDIO_DIR
+            filepath = output_dir / f"clone_{filename_base}.mp3"
+            filepath.write_bytes(audio_data)
+            return str(filepath)
     
     def _estimate_duration(self, audio_data: bytes) -> float:
         """Estimate audio duration from MP3 data."""

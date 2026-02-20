@@ -54,5 +54,10 @@ class Settings(BaseSettings):
     
     # Redis (for rate limiting)
     REDIS_URL: str = "redis://localhost:6379/0"
+    
+    # Cloudinary (cloud storage for audio/reports)
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
 
 settings = Settings()
