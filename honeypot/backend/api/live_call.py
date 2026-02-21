@@ -21,6 +21,7 @@ from features.live_takeover.report_generator import report_generator
 from features.live_takeover.streaming_stt import StreamingTranscriber, AudioNormalizer
 from features.live_takeover.takeover_agent import takeover_agent
 from services.elevenlabs_service import elevenlabs_service
+from services.tts_service import tts_service
 
 router = APIRouter()
 logger = logging.getLogger("api.live_call")
@@ -582,8 +583,8 @@ async def extract_intelligence(call_id: str, text: str, session: CallSession):
 
 async def provide_ai_coaching(call_id: str, session: CallSession):
     """
-    Provide AI coaching suggestions to operator based on conversation context.
-    Also generates AI voice response using ElevenLabs if needed.
+    Generate AI response and send audio to scammer (AI speaks to scammer).
+    Also notify operator of what AI said (text-only monitoring).
     """
     try:
         # Get recent conversation context
@@ -595,7 +596,7 @@ async def provide_ai_coaching(call_id: str, session: CallSession):
             for msg in recent_transcript
         ])
         
-        # Get AI coaching from takeover agent
+        # Get AI response from takeover agent
         coaching = await takeover_agent.get_coaching_suggestions(
             conversation=conversation,
             entities=session.entities,
@@ -603,68 +604,74 @@ async def provide_ai_coaching(call_id: str, session: CallSession):
             tactics=session.tactics
         )
         
-        # Optionally generate AI voice for recommended response
-        audio_data = None
-        if coaching.get("recommended_response"):
-            try:
-                # Use ElevenLabs to synthesize the AI response
-                voice_name = getattr(settings, 'ELEVENLABS_DEFAULT_VOICE', 'Rachel')
-                audio_result = await elevenlabs_service.synthesize(
-                    text=coaching["recommended_response"],
-                    voice_name=voice_name,
-                    session_id=call_id
-                )
-                
-                if audio_result.get("audio_path") and not audio_result.get("error"):
-                    # Use local_path for reading file bytes (audio_path may be Cloudinary URL)
-                    local_path = audio_result.get("local_path") or audio_result.get("audio_path")
-                    
-                    # Check if it's a local file we can read
-                    from pathlib import Path as FilePath
-                    if local_path and not local_path.startswith("http") and FilePath(local_path).exists():
-                        with open(local_path, 'rb') as f:
-                            audio_bytes = f.read()
-                            audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-                            audio_data = {
-                                "audio_base64": audio_base64,
-                                "format": "mp3",
-                                "duration": audio_result.get("duration", 0)
-                            }
-                    elif local_path and local_path.startswith("http"):
-                        # If it's a Cloudinary URL, download and convert to base64
-                        try:
-                            import httpx
-                            async with httpx.AsyncClient() as http_client:
-                                resp = await http_client.get(local_path, timeout=15.0)
-                                if resp.status_code == 200:
-                                    audio_base64 = base64.b64encode(resp.content).decode('utf-8')
-                                    audio_data = {
-                                        "audio_base64": audio_base64,
-                                        "format": "mp3",
-                                        "duration": audio_result.get("duration", 0)
-                                    }
-                        except Exception as dl_err:
-                            logger.warning(f"Failed to download audio from URL: {dl_err}")
-                    
-                    logger.info(f"✅ Generated AI voice using ElevenLabs ({voice_name})")
-            except Exception as voice_error:
-                logger.warning(f"AI voice generation failed: {voice_error}")
+        # Extract AI response text (what AI will say to scammer)
+        ai_response_text = coaching.get("recommended_response", "")
         
-        # Send coaching to operator
-        await call_manager.send_to_operator(call_id, {
-            "type": "ai_coaching",
-            "intent": coaching.get("intent", "Unknown"),
-            "confidence": coaching.get("confidence", 0.0),
-            "reasoning": coaching.get("reasoning", ""),
-            "suggestions": coaching.get("suggestions", []),
-            "recommended_response": coaching.get("recommended_response"),
-            "recommended_audio": audio_data,
-            "warning": coaching.get("warning"),
+        if not ai_response_text:
+            logger.warning("[AI TAKEOVER] No response text generated, skipping TTS")
+            return
+        
+        # Step 1 — Synthesize AI voice
+        audio_base64 = None
+        try:
+            from config import settings
+            voice_id = getattr(settings, 'ELEVENLABS_VOICE_ID', None)
+            
+            logger.info(f"[AI TAKEOVER] Generating voice for scammer: '{ai_response_text[:80]}...'")
+            audio_bytes = await tts_service.synthesize_to_bytes(
+                text=ai_response_text,
+                voice_id=voice_id
+            )
+            
+            if audio_bytes:
+                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                logger.info(f"[AI TAKEOVER] TTS synthesized {len(audio_bytes)} bytes for scammer")
+            else:
+                logger.warning("[AI TAKEOVER] synthesize_to_bytes returned None")
+                
+        except Exception as e:
+            logger.error(f"[AI TAKEOVER] TTS failed: {e}", exc_info=True)
+        
+        # Step 2 — Send AI voice audio to SCAMMER so they hear it
+        if audio_base64 and session.scammer_ws:
+            try:
+                await session.scammer_ws.send_json({
+                    "type": "audio",               # same type as regular audio relay
+                    "data": audio_base64,          # scammer frontend plays this like operator audio
+                    "from": "ai",                  # identifies source as AI not operator
+                    "format": "mp3",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                logger.info("[AI TAKEOVER] AI audio sent to scammer successfully")
+            except Exception as e:
+                logger.error(f"[AI TAKEOVER] Failed to send audio to scammer: {e}")
+        
+        # Step 3 — Notify OPERATOR what the AI said (text only, no audio — operator monitors silently)
+        if session.operator_ws:
+            try:
+                await session.operator_ws.send_json({
+                    "type": "ai_response_sent",    # NEW event type — operator sees transcript only
+                    "text": ai_response_text,
+                    "strategy": coaching.get("strategy", ""),
+                    "intent": coaching.get("intent", ""),
+                    "confidence": coaching.get("confidence", 0.0),
+                    "reasoning": coaching.get("reasoning", ""),
+                    "threat_level": session.threat_level,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                logger.info("[AI TAKEOVER] Operator notified of AI response (text-only)")
+            except Exception as e:
+                logger.error(f"[AI TAKEOVER] Failed to notify operator: {e}")
+        
+        # Step 4 — Also append AI response to session transcript
+        session.transcript.append({
+            "speaker": "ai",
+            "text": ai_response_text,
             "timestamp": datetime.utcnow().isoformat()
         })
     
     except Exception as e:
-        logger.error(f"AI coaching error: {e}", exc_info=True)
+        logger.error(f"[AI TAKEOVER] Error in provide_ai_coaching: {e}", exc_info=True)
 
 
 async def handle_text_message(call_id: str, role: str, data: dict, session: CallSession):

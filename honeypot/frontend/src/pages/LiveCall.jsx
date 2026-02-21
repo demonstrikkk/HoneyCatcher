@@ -63,6 +63,10 @@ const LiveCall = () => {
     
     wsRef.current.onmessage = async (event) => {
       const data = JSON.parse(event.data);
+      console.log('[WS RECEIVED]', data.type, '| Fields:', Object.keys(data).join(', '));
+      if (data.type === 'ai_response_sent') {
+        console.log('[AI_RESPONSE_SENT] Text:', data.text?.substring(0, 50), '| Strategy:', data.strategy);
+      }
       handleWebSocketMessage(data);
     };
     
@@ -123,25 +127,25 @@ const LiveCall = () => {
         }
         break;
       
-      case 'ai_coaching':
-        // Display AI coaching suggestions (operator only)
+      case 'ai_response_sent':
+        // NEW: AI spoke to scammer — show text transcript to operator (no audio)
         if (role === 'operator') {
-          setAiCoaching(data.suggestions || []);
-          if (data.recommended_response) {
-            setTranscript(prev => [...prev, {
-              type: 'ai_suggestion',
-              text: `💡 AI Suggests: "${data.recommended_response}"`,
-              timestamp: data.timestamp
+          // Add AI's response to transcript for operator to monitor
+          setTranscript(prev => [...prev, {
+            type: 'ai_response',
+            speaker: 'ai',
+            text: data.text,
+            timestamp: data.timestamp
+          }]);
+          // Also add to coaching panel for context
+          if (data.strategy || data.intent) {
+            setAiCoaching(prev => [...prev, {
+              text: `🤖 AI spoke: "${data.text}"`,
+              strategy: data.strategy,
+              intent: data.intent
             }]);
           }
-          // Play AI voice if available
-          if (data.recommended_audio) {
-            console.log('🔊 Playing AI voice response from ElevenLabs');
-            await playIncomingAudio(
-              data.recommended_audio.audio_base64, 
-              data.recommended_audio.format || 'mp3'
-            );
-          }
+          // NO audio playback — operator monitors silently, scammer hears the AI
         }
         break;
       
@@ -627,7 +631,7 @@ const LiveCall = () => {
           {/* Operator Intelligence Panel */}
           {role === 'operator' && (
             <div className="space-y-6">
-              {/* AI Coaching */}
+              {/* AI Response Log */}
               <motion.div
                 initial={{ opacity: 0, x: 20 }}
                 animate={{ opacity: 1, x: 0 }}
@@ -635,20 +639,20 @@ const LiveCall = () => {
               >
                 <div className="flex items-center gap-3 mb-4">
                   <Lightbulb className="w-5 h-5 text-emerald-400" />
-                  <h3 className="font-black text-emerald-400 uppercase text-sm tracking-wider">AI Coaching</h3>
+                  <h3 className="font-black text-emerald-400 uppercase text-sm tracking-wider">What AI Said</h3>
                 </div>
                 {aiCoaching.length === 0 ? (
-                  <p className="text-slate-600 text-sm font-medium">AI suggestions will appear here...</p>
+                  <p className="text-slate-600 text-sm font-medium">AI responses to scammer will appear here...</p>
                 ) : (
                   <div className="space-y-3">
-                    {aiCoaching.map((suggestion, idx) => (
+                    {aiCoaching.map((item, idx) => (
                       <motion.div
                         key={idx}
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}
                         className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl"
                       >
-                        <p className="text-emerald-200 text-sm font-medium leading-relaxed">{suggestion}</p>
+                        <p className="text-emerald-200 text-sm font-medium leading-relaxed">{typeof item === 'string' ? item : item.text}</p>
                       </motion.div>
                     ))}
                   </div>
