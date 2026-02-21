@@ -285,7 +285,7 @@ class ElevenLabsService:
         try:
             from services.tts_service import tts_service
             logger.warning("⚠️ Falling back to system TTS")
-            return tts_service.synthesize(text, session_id=session_id)
+            return await tts_service.synthesize(text, session_id=session_id)
         except Exception as e:
             logger.error(f"Fallback TTS also failed: {e}")
             return {

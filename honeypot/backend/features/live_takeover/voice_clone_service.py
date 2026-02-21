@@ -343,7 +343,7 @@ class VoiceCloneService:
         try:
             from services.tts_service import tts_service
             
-            result = tts_service.synthesize(
+            result = await tts_service.synthesize(
                 text=text,
                 language="en",
                 session_id=session_id or "live-fallback"

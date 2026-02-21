@@ -71,7 +71,7 @@ class TTSService:
         
         self._initialized = True
     
-    def synthesize(
+    async def synthesize(
         self,
         text: str,
         language: str = "en",
