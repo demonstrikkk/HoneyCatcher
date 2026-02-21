@@ -12,6 +12,7 @@ from agents.graph import agent_system
 from agents.speech_naturalizer import speech_naturalizer
 from services.stt_service import stt_service
 from services.tts_service import tts_service
+from services.elevenlabs_service import elevenlabs_service
 from services.audio_processor import audio_processor
 
 logger = logging.getLogger("voice_adapter")
@@ -25,6 +26,7 @@ class VoiceAdapter:
         self.agent = agent_system
         self.stt = stt_service
         self.tts = tts_service
+        self.elevenlabs = elevenlabs_service
         self.naturalizer = speech_naturalizer
         self.processor = audio_processor
 
@@ -91,15 +93,31 @@ class VoiceAdapter:
                 "mode": mode
             }
             
-            # 2. Synthesize if autonomous mode
+            # 2. Synthesize if autonomous mode - use ElevenLabs as primary TTS
             if mode == "ai_speaks":
-                tts_result = self.tts.synthesize(
-                    naturalized_text, 
-                    language=language, 
-                    session_id=session_id
-                )
-                result["audio_path"] = tts_result["audio_path"]
-                result["duration"] = tts_result["duration"]
+                try:
+                    # Primary: ElevenLabs high-quality voices
+                    tts_result = await self.elevenlabs.synthesize(
+                        text=naturalized_text,
+                        session_id=session_id
+                    )
+                    if tts_result.get("audio_path") and not tts_result.get("error"):
+                        result["audio_path"] = tts_result["audio_path"]
+                        result["duration"] = tts_result.get("duration", 0)
+                        result["voice_name"] = tts_result.get("voice_name", "Rachel")
+                        logger.info(f"ElevenLabs TTS success: {tts_result.get('voice_name', 'Rachel')}")
+                    else:
+                        raise Exception(tts_result.get("error", "ElevenLabs returned no audio"))
+                except Exception as e:
+                    logger.warning(f"ElevenLabs TTS failed, falling back to system TTS: {e}")
+                    # Fallback: system TTS
+                    tts_result = await self.tts.synthesize(
+                        naturalized_text,
+                        language=language,
+                        session_id=session_id
+                    )
+                    result["audio_path"] = tts_result.get("audio_path")
+                    result["duration"] = tts_result.get("duration", 0)
             
             return result
         except Exception as e:

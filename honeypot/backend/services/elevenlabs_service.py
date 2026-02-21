@@ -302,6 +302,9 @@ class ElevenLabsService:
         # Get audio duration
         duration = self._estimate_duration(audio_path)
         
+        # Keep local path for file reading (e.g., base64 encoding for WebSocket)
+        local_path = audio_path
+        
         # Upload to Cloudinary for persistent storage
         audio_url = audio_path  # fallback
         try:
@@ -318,6 +321,7 @@ class ElevenLabsService:
         
         return {
             "audio_path": audio_url,
+            "local_path": local_path,
             "duration": duration,
             "format": "mp3",
             "voice_id": voice_id,

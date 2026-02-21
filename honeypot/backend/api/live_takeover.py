@@ -501,19 +501,35 @@ async def _handle_audio_chunk(
                 "source": "ai_takeover"
             })
             
-            # Synthesize voice with clone
+            # Synthesize voice - use voice clone if available, otherwise ElevenLabs
             audio_result = None
+            audio_bytes = None
             if session.voice_clone_id:
                 try:
                     audio_result = await voice_clone_service.synthesize(
                         text=response_text,
                         voice_id=session.voice_clone_id
                     )
+                    audio_bytes = audio_result["audio_data"] if audio_result else None
                 except Exception as e:
-                    logger.error(f"Voice synthesis error: {e}")
+                    logger.error(f"Voice clone synthesis error: {e}")
             
-            # Extract audio bytes if available
-            audio_bytes = audio_result["audio_data"] if audio_result else None
+            # Fallback to ElevenLabs default voices if no clone or clone failed
+            if audio_bytes is None:
+                try:
+                    from services.elevenlabs_service import elevenlabs_service
+                    from services.tts_service import tts_service
+                    el_audio = await tts_service.synthesize_to_bytes(
+                        text=response_text,
+                        voice_id=getattr(settings, 'ELEVENLABS_VOICE_ID', '21m00Tcm4TlvDq8ikWAM')
+                    )
+                    if el_audio:
+                        audio_bytes = el_audio
+                        logger.info("✅ ElevenLabs fallback TTS used for ai_takeover response")
+                    else:
+                        logger.warning("ElevenLabs fallback returned no audio")
+                except Exception as el_err:
+                    logger.warning(f"ElevenLabs fallback TTS failed: {el_err}")
             
             await websocket.send_json({
                 "type": "ai_response",

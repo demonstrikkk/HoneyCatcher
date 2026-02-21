@@ -109,7 +109,22 @@ class TTSService:
                 output_file = self.output_path / filename
             
             # Try ElevenLabs first (Primary high-quality TTS)
-             
+            try:
+                from services.elevenlabs_service import elevenlabs_service
+                el_result = await elevenlabs_service.synthesize(
+                    text=text,
+                    session_id=session_id
+                )
+                if el_result.get("audio_path") and not el_result.get("error"):
+                    logger.info("✅ ElevenLabs TTS used as primary engine")
+                    return {
+                        "audio_path": el_result["audio_path"],
+                        "duration": el_result.get("duration", 0.0),
+                        "format": "mp3",
+                        "language": language
+                    }
+            except Exception as el_err:
+                logger.warning(f"ElevenLabs TTS failed in tts_service: {el_err}")
                 
             # Try Piper next (Local fallback)
             if self.engine_type == 'piper':

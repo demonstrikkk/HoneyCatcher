@@ -616,12 +616,13 @@ async def provide_ai_coaching(call_id: str, session: CallSession):
                 )
                 
                 if audio_result.get("audio_path") and not audio_result.get("error"):
-                    # Read audio file and convert to base64
-                    import base64
-                    from pathlib import Path
-                    audio_path = audio_result["audio_path"]
-                    if Path(audio_path).exists():
-                        with open(audio_path, 'rb') as f:
+                    # Use local_path for reading file bytes (audio_path may be Cloudinary URL)
+                    local_path = audio_result.get("local_path") or audio_result.get("audio_path")
+                    
+                    # Check if it's a local file we can read
+                    from pathlib import Path as FilePath
+                    if local_path and not local_path.startswith("http") and FilePath(local_path).exists():
+                        with open(local_path, 'rb') as f:
                             audio_bytes = f.read()
                             audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
                             audio_data = {
@@ -629,6 +630,22 @@ async def provide_ai_coaching(call_id: str, session: CallSession):
                                 "format": "mp3",
                                 "duration": audio_result.get("duration", 0)
                             }
+                    elif local_path and local_path.startswith("http"):
+                        # If it's a Cloudinary URL, download and convert to base64
+                        try:
+                            import httpx
+                            async with httpx.AsyncClient() as http_client:
+                                resp = await http_client.get(local_path, timeout=15.0)
+                                if resp.status_code == 200:
+                                    audio_base64 = base64.b64encode(resp.content).decode('utf-8')
+                                    audio_data = {
+                                        "audio_base64": audio_base64,
+                                        "format": "mp3",
+                                        "duration": audio_result.get("duration", 0)
+                                    }
+                        except Exception as dl_err:
+                            logger.warning(f"Failed to download audio from URL: {dl_err}")
+                    
                     logger.info(f"✅ Generated AI voice using ElevenLabs ({voice_name})")
             except Exception as voice_error:
                 logger.warning(f"AI voice generation failed: {voice_error}")

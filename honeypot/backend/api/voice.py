@@ -154,7 +154,13 @@ async def upload_voice_chunk(
             "transcription": result["scammer_transcription"],
             "reply": result["agent_reply"],
             "naturalizedReply": result["agent_naturalized"],
-            "audioUrl": f"/api/voice/audio/{sessionId}/{Path(result['agent_audio_path']).name}" if result["agent_audio_path"] else None,
+            "audioUrl": (
+                result["agent_audio_path"]
+                if result.get("agent_audio_path") and result["agent_audio_path"].startswith("http")
+                else f"/api/voice/audio/{sessionId}/{Path(result['agent_audio_path']).name}"
+                if result.get("agent_audio_path")
+                else None
+            ),
             "mode": mode
         }
 
