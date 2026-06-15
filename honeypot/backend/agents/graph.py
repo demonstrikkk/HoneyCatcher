@@ -1,191 +1,152 @@
-import os
-import operator
-from typing import Annotated, Sequence, TypedDict, Union, List, Dict,  Any
-from langchain_groq import ChatGroq
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+import json
+import logging
+from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-
-from agents.prompts import (
-    SYSTEM_PROMPT, 
-    PERSONA_PROMPT, 
-    INTENT_ANALYSIS_PROMPT, 
-    RESPONSE_PLANNER_PROMPT, 
-    HUMANIZER_PROMPT
-)
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+from agents.prompts import INTENT_PROMPT, STRATEGY_PROMPT, COACHING_PROMPT, RESPONSE_PROMPT
 from config import settings
 
-# State Definition
+logger = logging.getLogger(__name__)
+
+_llm = ChatGroq(
+    api_key=settings.GROQ_API_KEY,
+    model_name=settings.GROQ_MODEL,
+    temperature=0.3,
+    max_tokens=256,
+)
+
+
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    intent: str
-    emotion: str
-    strategy: str
-    draft_response: str
-    final_response: str
+    scammer_text: str
+    history: List[dict]
+    mode: str
     turn_count: int
+    intent: Optional[str]
+    intent_confidence: Optional[float]
+    strategy: Optional[str]
+    coaching_text: Optional[str]
+    coaching_scripts: Optional[List[str]]
+    ai_response: Optional[str]
+    error: Optional[str]
 
-class HoneyPotAgent:
-    def __init__(self):
-        self.groq_key = settings.GROQ_API_KEY
-        self.gemini_key = settings.GEMINI_API_KEY
-        
-        # Primary LLM (Groq)
-        if self.groq_key:
-            self.llm = ChatGroq(temperature=0.7, model_name="llama-3.3-70b-versatile", api_key=self.groq_key)
-        else:
-            self.llm = None
-            
-        # Fallback (Gemini)
-        if self.gemini_key:
-            self.fallback_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=self.gemini_key)
-        else:
-            self.fallback_llm = None
 
-        self.workflow = self._build_graph()
+def _parse_json(content: str) -> dict:
+    try:
+        clean = content.strip().removeprefix("```json").removesuffix("```").strip()
+        return json.loads(clean)
+    except Exception:
+        logger.warning("Failed to parse LLM JSON: %s", content[:200])
+        return {}
 
-    def _get_llm(self):
-        return self.llm if self.llm else self.fallback_llm
 
-    def _analyze_intent(self, state: AgentState):
-        """Node 1: Analyze scamer intent"""
-        messages = state["messages"]
-        last_msg = messages[-1].content
-        
-        llm = self._get_llm()
-        if not llm:
-             return {"intent": "scam", "emotion": "aggressive", "strategy": "stall"}
+async def _call_llm(prompt: str) -> dict:
+    try:
+        response = await _llm.ainvoke([HumanMessage(content=prompt)])
+        return _parse_json(response.content)
+    except Exception as e:
+        logger.error("LLM call failed: %s", e)
+        return {}
 
-        # New pattern: System prompt + User input
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", INTENT_ANALYSIS_PROMPT),
-            ("user", "{input}")
-        ])
-        
-        chain = prompt | llm | JsonOutputParser()
-        
-        try:
-            result = chain.invoke({"input": last_msg})
-            return {
-                "intent": result.get("intent", "unknown"),
-                "emotion": result.get("emotion", "neutral"),
-                "strategy": result.get("strategy", "stall"),
-                "behavioral_notes": result.get("behavioral_notes", "")
-            }
-        except Exception as e:
-             # logger.warning(f"Intent analysis failed: {e}")
-             return {
-                 "intent": "unknown", 
-                 "emotion": "neutral", 
-                 "strategy": "stall",
-                 "behavioral_notes": "Scammer is engaging in suspicious behavior."
-             }
 
-    def _generate_response(self, state: AgentState):
-        """Node 2: Generate draft response"""
-        # Format history simply
-        history_text = "\n".join([f"{m.type}: {m.content}" for m in state["messages"][-5:]])
-        
-        # Combine System + Persona + Strategy + History
-        full_system_prompt = f"{SYSTEM_PROMPT}\n\n{PERSONA_PROMPT}\n\n{RESPONSE_PLANNER_PROMPT}"
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", full_system_prompt),
-            ("user", "Context: {history}\nStrategy: {strategy}")
-        ])
-        
-        llm = self._get_llm()
-        if not llm:
-            return {"draft_response": "I am not sure what do you mean. Can you explain?"}
+async def node_intent(state: AgentState) -> AgentState:
+    result = await _call_llm(
+        INTENT_PROMPT.format(text=state["scammer_text"])
+    )
+    return {
+        **state,
+        "intent": result.get("intent", "unknown"),
+        "intent_confidence": result.get("confidence", 0.5),
+    }
 
-        chain = prompt | llm | StrOutputParser()
-        
-        try:
-            result = chain.invoke({
-                "history": history_text,
-                "strategy": state["strategy"]
-            })
-            return {"draft_response": result}
-        except Exception:
-            return {"draft_response": "I am confused."}
 
-    def _humanize(self, state: AgentState):
-        """Node 3: Humanize the output"""
-        draft = state["draft_response"]
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", HUMANIZER_PROMPT),
-            ("user", "Input: {text}")
-        ])
-        
-        llm = self._get_llm()
-        if not llm:
-             return {"final_response": draft, "turn_count": state["turn_count"] + 1}
+async def node_strategy(state: AgentState) -> AgentState:
+    result = await _call_llm(
+        STRATEGY_PROMPT.format(
+            intent=state["intent"],
+            turn_count=state["turn_count"],
+        )
+    )
+    return {**state, "strategy": result.get("strategy", "empathy")}
 
-        chain = prompt | llm | StrOutputParser()
-        
-        try:
-            result = chain.invoke({"text": draft})
-        except:
-            result = draft
-            
-        return {"final_response": result, "turn_count": state["turn_count"] + 1}
 
-    def _build_graph(self):
-        workflow = StateGraph(AgentState)
-        
-        workflow.add_node("analyze", self._analyze_intent)
-        workflow.add_node("generate", self._generate_response)
-        workflow.add_node("humanize", self._humanize)
-        
-        workflow.set_entry_point("analyze")
-        workflow.add_edge("analyze", "generate")
-        workflow.add_edge("generate", "humanize")
-        workflow.add_edge("humanize", END)
-        
-        return workflow.compile()
+async def node_coaching(state: AgentState) -> AgentState:
+    history_str = "\n".join(
+        f"{m['speaker']}: {m['text']}" for m in state["history"][-3:]
+    )
+    result = await _call_llm(
+        COACHING_PROMPT.format(
+            scammer_text=state["scammer_text"],
+            intent=state["intent"],
+            strategy=state["strategy"],
+        )
+    )
+    return {
+        **state,
+        "coaching_text": result.get("text", ""),
+        "coaching_scripts": result.get("scripts", []),
+    }
 
-    async def run(self, history: List[Dict[str, str]]) -> Dict[str, Any]:
-        """
-        Run the agent graph.
-        History format: [{"role": "scammer", "content": "..."}, ...]
-        Returns dict with: reply, intent, emotion, strategy, notes
-        """
-        lc_messages = []
-        for h in history:
-            if h["role"] == "scammer":
-                lc_messages.append(HumanMessage(content=h["content"]))
-            elif h["role"] == "agent":
-                lc_messages.append(AIMessage(content=h["content"]))
-        
-        initial_state = {
-            "messages": lc_messages,
-            "turn_count": 0,
-            "intent": "",
-            "emotion": "",
-            "strategy": "",
-            "draft_response": "",
-            "final_response": ""
-        }
-        
-        try:
-            result = await self.workflow.ainvoke(initial_state)
-            return {
-                "reply": result.get("final_response", "I am sorry, I didn't understand that."),
-                "intent": result.get("intent", "unknown"),
-                "emotion": result.get("emotion", "unknown"),
-                "strategy": result.get("strategy", "unknown"),
-                "notes": result.get("behavioral_notes", "Suspicious interaction.")
-            }
-        except Exception as e:
-            import logging
-            logging.error(f"Agent graph error: {e}", exc_info=True)
-            return {
-                "reply": "I... am having trouble with my phone line.",
-                "intent": "fault",
-                "notes": "System error during engagement."
-            }
 
-agent_system = HoneyPotAgent()
+async def node_response(state: AgentState) -> AgentState:
+    history_str = "\n".join(
+        f"{m['speaker']}: {m['text']}" for m in state["history"][-3:]
+    )
+    result = await _call_llm(
+        RESPONSE_PROMPT.format(
+            scammer_text=state["scammer_text"],
+            strategy=state["strategy"],
+            history=history_str,
+        )
+    )
+    return {**state, "ai_response": result.get("text", "")}
+
+
+def _route_mode(state: AgentState) -> str:
+    return "coaching" if state["mode"] == "ai_coached" else "response"
+
+
+def build_agent_graph():
+    g = StateGraph(AgentState)
+
+    g.add_node("analyze_intent",    node_intent)
+    g.add_node("plan_strategy",     node_strategy)
+    g.add_node("generate_coaching", node_coaching)
+    g.add_node("generate_response", node_response)
+
+    g.set_entry_point("analyze_intent")
+    g.add_edge("analyze_intent", "plan_strategy")
+    g.add_conditional_edges("plan_strategy", _route_mode, {
+        "coaching": "generate_coaching",
+        "response": "generate_response",
+    })
+    g.add_edge("generate_coaching", END)
+    g.add_edge("generate_response", END)
+
+    return g.compile()
+
+
+agent_graph = build_agent_graph()
+
+
+async def run_agent(
+    scammer_text: str,
+    history: list,
+    mode: str = "ai_coached",
+    turn_count: int = 0,
+) -> dict:
+    initial: AgentState = {
+        "scammer_text": scammer_text,
+        "history": history,
+        "mode": mode,
+        "turn_count": turn_count,
+        "intent": None,
+        "intent_confidence": None,
+        "strategy": None,
+        "coaching_text": None,
+        "coaching_scripts": None,
+        "ai_response": None,
+        "error": None,
+    }
+    result = await agent_graph.ainvoke(initial)
+    return result

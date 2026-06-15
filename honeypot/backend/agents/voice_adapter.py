@@ -1,176 +1,130 @@
-"""
-Voice Adapter for HoneyPot Agent
-Integrates voice processing into the agentic flow.
-Handles the transformation of:
-1. Scammer Audio -> Transcription -> Agent Input
-2. Agent Reply -> Speech Naturalization -> TTS synthesis
-"""
-
 import logging
 from typing import List, Dict, Optional
-from agents.graph import agent_system
+from agents.graph import run_agent
 from agents.speech_naturalizer import speech_naturalizer
-from services.stt_service import stt_service
-from services.tts_service import tts_service
-from services.elevenlabs_service import elevenlabs_service
+from services.stt_service import transcribe_bytes
+from services.tts_service import synthesize_to_bytes
 from services.audio_processor import audio_processor
 
 logger = logging.getLogger("voice_adapter")
 
+
 class VoiceAdapter:
-    """
-    Adapter to bridge voice I/O with the existing LangGraph agent.
-    """
-    
+
     def __init__(self):
-        self.agent = agent_system
-        self.stt = stt_service
-        self.tts = tts_service
-        self.elevenlabs = elevenlabs_service
         self.naturalizer = speech_naturalizer
         self.processor = audio_processor
 
     async def process_scammer_audio(
-        self, 
-        session_id: str, 
-        audio_data: bytes, 
+        self,
+        session_id: str,
+        audio_data: bytes,
         format: str = "wav",
         language: Optional[str] = None
     ) -> Dict[str, any]:
-        """
-        Processes incoming scammer audio:
-        1. Normalizes audio
-        2. Transcribes to text
-        3. Returns transcription results
-        """
         try:
-            # 1. Normalize
             normalized_audio, metadata = self.processor.normalize_audio(audio_data, source_format=format)
-            
-            # 2. Transcribe
-            stt_result = self.stt.transcribe_bytes(
-                normalized_audio, 
-                format="wav", 
-                language=language
-            )
-            
+
+            stt_result = await transcribe_bytes(normalized_audio, fmt="wav")
+
             return {
-                "text": stt_result["text"],
-                "language": stt_result["language"],
-                "confidence": stt_result["confidence"],
-                "duration": stt_result["duration"],
-                "metadata": metadata
+                "text": stt_result.get("text", ""),
+                "language": stt_result.get("language", "en"),
+                "confidence": stt_result.get("confidence", 0.0),
+                "duration": metadata.get("duration", 0),
+                "metadata": metadata,
             }
         except Exception as e:
-            logger.error(f"Failed to process scammer audio: {e}", exc_info=True)
+            logger.error("Failed to process scammer audio: %s", e, exc_info=True)
             return {
                 "text": "",
                 "language": language or "en",
                 "confidence": 0.0,
-                "error": str(e)
+                "error": str(e),
             }
 
     async def generate_agent_voice(
-        self, 
-        session_id: str, 
-        text_response: str, 
+        self,
+        session_id: str,
+        text_response: str,
         language: str = "en",
         mode: str = "ai_speaks"
     ) -> Dict[str, any]:
-        """
-        Processes outgoing agent response:
-        1. Naturalizes text for speech
-        2. Synthesizes audio if mode is ai_speaks
-        3. Returns result
-        """
         try:
-            # 1. Naturalize
             naturalized_text = await self.naturalizer.naturalize(text_response, language=language)
-            
+
             result = {
                 "naturalized_text": naturalized_text,
                 "original_text": text_response,
-                "mode": mode
+                "mode": mode,
             }
-            
-            # 2. Synthesize if autonomous mode - use ElevenLabs as primary TTS
+
             if mode == "ai_speaks":
                 try:
-                    # Primary: ElevenLabs high-quality voices
-                    tts_result = await self.elevenlabs.synthesize(
+                    from services.elevenlabs_service import elevenlabs_service
+                    tts_result = await elevenlabs_service.synthesize(
                         text=naturalized_text,
-                        session_id=session_id
+                        session_id=session_id,
                     )
                     if tts_result.get("audio_path") and not tts_result.get("error"):
                         result["audio_path"] = tts_result["audio_path"]
                         result["duration"] = tts_result.get("duration", 0)
                         result["voice_name"] = tts_result.get("voice_name", "Rachel")
-                        logger.info(f"ElevenLabs TTS success: {tts_result.get('voice_name', 'Rachel')}")
                     else:
                         raise Exception(tts_result.get("error", "ElevenLabs returned no audio"))
                 except Exception as e:
-                    logger.warning(f"ElevenLabs TTS failed, falling back to system TTS: {e}")
-                    # Fallback: system TTS
-                    tts_result = await self.tts.synthesize(
-                        naturalized_text,
-                        language=language,
-                        session_id=session_id
-                    )
-                    result["audio_path"] = tts_result.get("audio_path")
-                    result["duration"] = tts_result.get("duration", 0)
-            
+                    logger.warning("ElevenLabs TTS failed, falling back: %s", e)
+                    audio_bytes = await synthesize_to_bytes(naturalized_text)
+                    result["audio_bytes"] = audio_bytes
+
             return result
         except Exception as e:
-            logger.error(f"Failed to generate agent voice: {e}", exc_info=True)
+            logger.error("Failed to generate agent voice: %s", e, exc_info=True)
             return {
                 "naturalized_text": text_response,
                 "original_text": text_response,
-                "error": str(e)
+                "error": str(e),
             }
 
     async def run_voice_turn(
-        self, 
-        session_id: str, 
-        audio_data: bytes, 
+        self,
+        session_id: str,
+        audio_data: bytes,
         history: List[Dict[str, str]],
         mode: str = "ai_speaks",
         format: str = "wav"
     ) -> Dict[str, any]:
-        """
-        Complete loop for a single voice turn.
-        """
-        # 1. Scammer speaks -> Text
         scammer_input = await self.process_scammer_audio(session_id, audio_data, format=format)
-        
-        if not scammer_input["text"]:
+
+        if not scammer_input.get("text"):
             return {"error": "No speech detected"}
 
-        # 2. Update history
-        full_history = history + [{"role": "scammer", "content": scammer_input["text"]}]
-        
-        # 3. Existing Agent Decision
-        agent_result = await self.agent.run(full_history)
-        agent_reply_text = agent_result["reply"] if isinstance(agent_result, dict) else agent_result
-        
-        # 4. Agent Text -> Voice
-        voice_output = await self.generate_agent_voice(
-            session_id, 
-            agent_reply_text, 
-            language=scammer_input["language"],
-            mode=mode
+        full_history = history + [{"speaker": "scammer", "text": scammer_input["text"]}]
+
+        agent_result = await run_agent(
+            scammer_text=scammer_input["text"],
+            history=full_history,
+            mode="ai_takeover" if mode == "ai_speaks" else "ai_coached",
         )
-        
+        agent_reply_text = agent_result.get("ai_response") or agent_result.get("coaching_text", "")
+
+        voice_output = await self.generate_agent_voice(
+            session_id,
+            agent_reply_text,
+            language=scammer_input.get("language", "en"),
+            mode=mode,
+        )
+
         return {
             "scammer_transcription": scammer_input["text"],
-            "scammer_language": scammer_input["language"],
+            "scammer_language": scammer_input.get("language", "en"),
             "agent_reply": agent_reply_text,
-            "agent_naturalized": voice_output["naturalized_text"],
+            "agent_naturalized": voice_output.get("naturalized_text", agent_reply_text),
             "agent_audio_path": voice_output.get("audio_path"),
             "mode": mode,
             "agent_intent": agent_result.get("intent", "unknown"),
-            "agent_emotion": agent_result.get("emotion", "unknown"),
-            "agent_strategy": agent_result.get("strategy", "unknown")
+            "agent_strategy": agent_result.get("strategy", "unknown"),
         }
 
-# Singleton instance
+
 voice_adapter = VoiceAdapter()

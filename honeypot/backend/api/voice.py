@@ -1,187 +1,59 @@
-"""
-Voice API Router
-Endpoints for voice upload, transcription, and synthesis.
-"""
-
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
-from pydantic import BaseModel
-from typing import Optional, List
-import logging
+import base64
 import uuid
-from datetime import datetime
-from pathlib import Path
+from fastapi import APIRouter, UploadFile, File, Form, Depends
+from core.auth import get_current_user
+from services.stt_service import transcribe_bytes
+from services.tts_service import synthesize_to_bytes
+from agents.graph import run_agent
+from db.mongo import get_collection
+from db.models import MessageInDB
 
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+router = APIRouter(prefix="/api/voice", tags=["voice"])
 
-from core.auth import verify_api_key
-from db.mongo import db
-from db.models import Session, Message, VoiceChunk
-from agents.voice_adapter import voice_adapter
-from services.audio_processor import audio_processor
-from services.intelligence_extractor import extraction_service
-from core.lifecycle import lifecycle_manager
 
-router = APIRouter()
-logger = logging.getLogger("api.voice")
-limiter = Limiter(key_func=get_remote_address)
-
-class VoiceResponse(BaseModel):
-    status: str
-    sessionId: str
-    transcription: Optional[str] = None
-    reply: Optional[str] = None
-    naturalizedReply: Optional[str] = None
-    audioUrl: Optional[str] = None
-    mode: str
-
-async def process_voice_background_tasks(session_id: str, transcription: str):
-    """
-    Background processing for intelligence extraction from voice.
-    """
-    if transcription:
-        # 1. Extract Intelligence
-        await extraction_service.extract(session_id, transcription)
-        
-        # 2. Check Lifecycle
-        await lifecycle_manager.check_termination(session_id)
-
-@router.post("/voice/upload", response_model=VoiceResponse)
-@limiter.limit("30/minute")
-async def upload_voice_chunk(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    sessionId: str = Form(...),
+@router.post("/upload")
+async def voice_upload(
     audio: UploadFile = File(...),
-    mode: str = Form("ai_speaks"),  # ai_speaks | ai_suggests
-    sequenceNumber: int = Form(0),
-    api_key: str = Depends(verify_api_key)
+    session_id: str = Form(...),
+    mode: str = Form("ai_speaks"),
+    user=Depends(get_current_user),
 ):
-    """
-    Receives an audio chunk, transcribes it, runs the agent, and returns voice response.
-    """
-    try:
-        logger.info(f"Received voice chunk for session {sessionId}, seq {sequenceNumber}")
-        
-        # 1. Read and Validate Session
-        session_data = await db.sessions.find_one({"session_id": sessionId})
-        if not session_data:
-            # Create session if not exists (similar to message.py)
-            session = Session(session_id=sessionId, voice_enabled=True, voice_mode=mode)
-            await db.sessions.insert_one(session.model_dump())
-        else:
-            session = Session(**session_data)
-            # Update session to voice enabled
-            if not session.voice_enabled:
-                await db.sessions.update_one(
-                    {"session_id": sessionId}, 
-                    {"$set": {"voice_enabled": True, "voice_mode": mode}}
-                )
+    audio_bytes = await audio.read()
+    fmt = audio.filename.rsplit(".", 1)[-1] if "." in audio.filename else "webm"
 
-        if session.status == "terminated":
-            return {
-                "status": "terminated",
-                "sessionId": sessionId,
-                "mode": mode
-            }
+    stt = await transcribe_bytes(audio_bytes, fmt)
+    scammer_text = stt.get("text", "")
 
-        # 2. Read Audio Data
-        audio_content = await audio.read()
-        
-        # 3. Process Voice Turn
-        # Fetch History for context
-        current_history_cursor = db.messages.find({"session_id": sessionId}).sort("timestamp", 1)
-        current_history = await current_history_cursor.to_list(length=20)
-        formatted_history = [{"role": m["sender"], "content": m["content"]} for m in current_history]
+    col_msg = get_collection("messages")
+    history_docs = await col_msg.find(
+        {"session_id": session_id},
+        {"_id": 0, "sender": 1, "content": 1},
+        sort=[("timestamp", -1)],
+        limit=6,
+    ).to_list(6)
+    history = [{"speaker": d["sender"], "text": d["content"]} for d in reversed(history_docs)]
 
-        # Use adapter for the heavy lifting
-        result = await voice_adapter.run_voice_turn(
-            session_id=sessionId,
-            audio_data=audio_content,
-            history=formatted_history,
-            mode=mode,
-            format=audio.filename.split('.')[-1] if '.' in audio.filename else "wav"
-        )
+    result = await run_agent(
+        scammer_text=scammer_text,
+        history=history,
+        mode="ai_takeover" if mode == "ai_speaks" else "ai_coached",
+    )
+    reply = result.get("ai_response") or result.get("coaching_text", "")
 
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
+    audio_b64 = ""
+    if mode == "ai_speaks" and reply:
+        tts_bytes = await synthesize_to_bytes(reply)
+        audio_b64 = base64.b64encode(tts_bytes).decode()
 
-        # 4. Save to DB
-        # Save Scammer message
-        scammer_msg = Message(
-            session_id=sessionId,
-            sender="scammer",
-            content=result["scammer_transcription"],
-            is_voice=True,
-            metadata={"confidence": result["scammer_language"]}
-        )
-        await db.messages.insert_one(scammer_msg.model_dump())
+    for sender, content in [("scammer", scammer_text), ("agent", reply)]:
+        if content:
+            msg = MessageInDB(session_id=session_id, sender=sender, content=content)
+            await col_msg.insert_one(msg.model_dump())
 
-        # Save Agent message
-        agent_msg = Message(
-            session_id=sessionId,
-            sender="agent",
-            content=result["agent_reply"],
-            is_voice=True,
-            speech_naturalized=True,
-            audio_file_path=result["agent_audio_path"],
-            metadata={"naturalized": result["agent_naturalized"]}
-        )
-        await db.messages.insert_one(agent_msg.model_dump())
-
-        # Update Session Metrics
-        await db.sessions.update_one(
-            {"session_id": sessionId},
-            {
-                "$inc": {"message_count": 2, "audio_chunk_count": 1},
-                "$set": {
-                    "last_updated": datetime.utcnow(),
-                    "detected_language": result["scammer_language"]
-                }
-            }
-        )
-
-        # 5. Background Intelligence Extraction
-        background_tasks.add_task(
-            process_voice_background_tasks, 
-            sessionId, 
-            result["scammer_transcription"]
-        )
-
-        return {
-            "status": "success",
-            "sessionId": sessionId,
-            "transcription": result["scammer_transcription"],
-            "reply": result["agent_reply"],
-            "naturalizedReply": result["agent_naturalized"],
-            "audioUrl": (
-                result["agent_audio_path"]
-                if result.get("agent_audio_path") and result["agent_audio_path"].startswith("http")
-                else f"/api/voice/audio/{sessionId}/{Path(result['agent_audio_path']).name}"
-                if result.get("agent_audio_path")
-                else None
-            ),
-            "mode": mode
-        }
-
-    except Exception as e:
-        logger.error(f"Voice upload error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/voice/audio/{session_id}/{filename}")
-async def get_audio_file(session_id: str, filename: str):
-    """
-    Serve generated audio files for playback.
-    """
-    from fastapi.responses import FileResponse
-    from services.tts_service import tts_service
-    
-    file_path = tts_service.output_path / session_id / filename
-    if not file_path.exists():
-        # Check root output path too just in case
-        file_path = tts_service.output_path / filename
-        
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Audio file not found")
-        
-    return FileResponse(file_path)
+    return {
+        "transcription": scammer_text,
+        "reply":         reply,
+        "audio_b64":     audio_b64,
+        "intent":        result.get("intent"),
+        "strategy":      result.get("strategy"),
+    }

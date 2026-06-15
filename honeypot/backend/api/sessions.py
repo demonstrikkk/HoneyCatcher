@@ -1,57 +1,49 @@
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Optional
-from db.mongo import db
-from db.models import Session
-from core.auth import verify_api_key
+from db.mongo import get_collection
+from db.models import SessionCreate, SessionInDB
+from core.auth import get_current_user
+from datetime import datetime
 
-router = APIRouter()
+router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
-@router.get("/sessions", response_model=List[dict])
-async def list_sessions(
-    voiceEnabled: Optional[bool] = None,
-    language: Optional[str] = None,
-    minScamScore: Optional[float] = None,
-    voiceMode: Optional[str] = None,
-    api_key: str = Depends(verify_api_key)
-):
-    query = {}
-    if voiceEnabled is not None:
-        query["voice_enabled"] = voiceEnabled
-    if language:
-        query["detected_language"] = language
-    if minScamScore is not None:
-        query["scam_score"] = {"$gte": minScamScore}
-    if voiceMode:
-        query["voice_mode"] = voiceMode
 
-    cursor = db.sessions.find(query).sort("last_updated", -1).limit(50)
-    sessions = await cursor.to_list(length=50)
-    # Fix serialization: convert _id to string or remove it
-    for s in sessions:
-        if "_id" in s:
-            s["id"] = str(s["_id"])
-            del s["_id"]
-    return sessions
+@router.post("", status_code=201)
+async def create_session(body: SessionCreate, user=Depends(get_current_user)):
+    session = SessionInDB(
+        user_id=user["sub"],
+        scammer_phone=body.scammer_phone,
+        operator_name=body.operator_name,
+        metadata={"call_type": body.call_type},
+    )
+    await get_collection("sessions").insert_one(session.model_dump())
+    return {"session_id": session.session_id}
 
-@router.get("/sessions/{session_id}")
-async def get_session(session_id: str, api_key: str = Depends(verify_api_key)):
-    session = await db.sessions.find_one({"session_id": session_id})
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Also fetch messages
-    messages = await db.messages.find({"session_id": session_id}).sort("timestamp", 1).to_list(length=100)
-    
-    # Fix serialization for session
-    if "_id" in session:
-        session["id"] = str(session["_id"])
-        del session["_id"]
-        
-    # Fix serialization for messages
-    for msg in messages:
-        if "_id" in msg:
-            msg["id"] = str(msg["_id"])
-            del msg["_id"]
 
-    session["history"] = messages
-    return session
+@router.get("")
+async def list_sessions(user=Depends(get_current_user)):
+    col = get_collection("sessions")
+    docs = await col.find(
+        {"user_id": user["sub"]},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+        limit=50
+    ).to_list(50)
+    return docs
+
+
+@router.get("/{session_id}")
+async def get_session(session_id: str, user=Depends(get_current_user)):
+    doc = await get_collection("sessions").find_one(
+        {"session_id": session_id, "user_id": user["sub"]}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(404, "Session not found")
+    return doc
+
+
+@router.delete("/{session_id}")
+async def delete_session(session_id: str, user=Depends(get_current_user)):
+    await get_collection("sessions").delete_one(
+        {"session_id": session_id, "user_id": user["sub"]}
+    )
+    return {"deleted": session_id}

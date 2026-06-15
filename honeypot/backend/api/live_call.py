@@ -1,708 +1,362 @@
 """
-Live Call API - Real-time Two-Way Voice Communication
-Enables real-time voice calls between scammer and operator with AI assistance.
+live_call.py -- WebSocket-based two-way live call with AI coaching.
+
+Endpoint:  ws://<host>/api/live-call/ws/{call_id}?role=operator|scammer
 """
 
 import asyncio
 import base64
-import json
+import io
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, List
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel
 
-from core.auth import verify_api_key
-from db.mongo import db
-from features.live_takeover.intelligence_pipeline import intelligence_pipeline
-from features.live_takeover.report_generator import report_generator
-from features.live_takeover.streaming_stt import StreamingTranscriber, AudioNormalizer
-from features.live_takeover.takeover_agent import takeover_agent
-from services.elevenlabs_service import elevenlabs_service
-from services.tts_service import tts_service
+from services.stt_service import transcribe_bytes
+from services.tts_service import synthesize_to_bytes
+from services.intelligence_extractor import extract_entities
+from agents.graph import run_agent
+from db.mongo import get_collection
 
-router = APIRouter()
-logger = logging.getLogger("api.live_call")
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/live-call", tags=["live-call"])
 
 
-# ── Models ────────────────────────────────────────────────────
+def normalize_audio(audio_bytes: bytes, fmt: str = "webm") -> bytes:
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
+        seg = seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        return seg.raw_data
+    except Exception as e:
+        logger.warning("Audio normalisation failed (%s) -- using raw bytes", e)
+        return audio_bytes
 
+
+@dataclass
+class AudioBuffer:
+    min_bytes: int = 16000 * 2 * 3
+    _buf: bytearray = field(default_factory=bytearray)
+
+    def add(self, chunk: bytes) -> None:
+        self._buf.extend(chunk)
+
+    def ready(self) -> bool:
+        return len(self._buf) >= self.min_bytes
+
+    def flush(self) -> bytes:
+        data = bytes(self._buf)
+        self._buf.clear()
+        return data
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+
+@dataclass
 class CallSession:
-    """Represents an active two-way call session."""
-    
-    def __init__(self, call_id: str):
-        self.call_id = call_id
-        self.operator_ws: Optional[WebSocket] = None
-        self.scammer_ws: Optional[WebSocket] = None
-        self.operator_transcriber = StreamingTranscriber()
-        self.scammer_transcriber = StreamingTranscriber()
-        self.normalizer = AudioNormalizer()
-        self.transcript = []
-        self.entities = []
-        self.threat_level = 0.0
-        self.tactics = []
-        self.start_time = datetime.utcnow()
-        self.is_active = True
-        
-    def has_both_participants(self) -> bool:
+    call_id: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
+
+    operator_ws: Optional[WebSocket] = None
+    scammer_ws: Optional[WebSocket] = None
+
+    operator_buf: AudioBuffer = field(default_factory=AudioBuffer)
+    scammer_buf: AudioBuffer = field(default_factory=AudioBuffer)
+
+    transcript: List[dict] = field(default_factory=list)
+    turn_count: int = 0
+
+    @property
+    def both_connected(self) -> bool:
         return self.operator_ws is not None and self.scammer_ws is not None
-    
-    async def close_all(self):
-        """Close all connections gracefully."""
-        self.is_active = False
+
+    async def send_operator(self, msg: dict) -> None:
         if self.operator_ws:
             try:
-                await self.operator_ws.close()
-            except:
+                await self.operator_ws.send_json(msg)
+            except Exception:
                 pass
+
+    async def send_scammer(self, msg: dict) -> None:
         if self.scammer_ws:
             try:
-                await self.scammer_ws.close()
-            except:
+                await self.scammer_ws.send_json(msg)
+            except Exception:
                 pass
+
+    async def broadcast(self, msg: dict) -> None:
+        await asyncio.gather(
+            self.send_operator(msg),
+            self.send_scammer(msg),
+            return_exceptions=True,
+        )
+
+    async def close_all(self) -> None:
+        self.is_active = False
+        for ws in (self.operator_ws, self.scammer_ws):
+            if ws:
+                try:
+                    await ws.close(code=1000)
+                except Exception:
+                    pass
 
 
 class CallManager:
-    """Manages active call sessions and audio routing."""
-    
     def __init__(self):
-        self.sessions: Dict[str, CallSession] = {}
-        self.operator_to_call: Dict[WebSocket, str] = {}
-        self.scammer_to_call: Dict[WebSocket, str] = {}
-    
-    def create_session(self, call_id: str) -> CallSession:
-        """Create a new call session."""
-        session = CallSession(call_id)
-        self.sessions[call_id] = session
-        logger.info(f"📞 Call session created: {call_id}")
-        return session
-    
-    def get_session(self, call_id: str) -> Optional[CallSession]:
-        """Get existing call session."""
-        return self.sessions.get(call_id)
-    
-    async def connect_operator(self, call_id: str, ws: WebSocket) -> CallSession:
-        """Connect operator to call session."""
-        session = self.sessions.get(call_id)
-        if not session:
-            session = self.create_session(call_id)
-        
-        await ws.accept()
-        session.operator_ws = ws
-        self.operator_to_call[ws] = call_id
-        logger.info(f"🎧 Operator connected to call: {call_id}")
-        
-        # Notify operator
-        await self.send_to_operator(call_id, {
-            "type": "connected",
-            "role": "operator",
-            "call_id": call_id,
-            "waiting_for_scammer": session.scammer_ws is None
-        })
-        
-        return session
-    
-    async def connect_scammer(self, call_id: str, ws: WebSocket) -> CallSession:
-        """Connect scammer to call session."""
-        session = self.sessions.get(call_id)
-        if not session:
-            session = self.create_session(call_id)
-        
-        await ws.accept()
-        session.scammer_ws = ws
-        self.scammer_to_call[ws] = call_id
-        logger.info(f"📱 Scammer connected to call: {call_id}")
-        
-        # Notify scammer
-        await self.send_to_scammer(call_id, {
-            "type": "connected",
-            "role": "scammer",
-            "call_id": call_id
-        })
-        
-        # Notify operator that scammer joined
-        if session.operator_ws:
-            await self.send_to_operator(call_id, {
-                "type": "participant_joined",
-                "role": "scammer",
-                "message": "Scammer has joined the call"
-            })
-        
-        return session
-    
-    def disconnect_operator(self, ws: WebSocket):
-        """Handle operator disconnect."""
-        call_id = self.operator_to_call.pop(ws, None)
-        if call_id:
-            session = self.sessions.get(call_id)
+        self._sessions: Dict[str, CallSession] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_or_create(self, call_id: str) -> CallSession:
+        async with self._lock:
+            if call_id not in self._sessions:
+                self._sessions[call_id] = CallSession(call_id=call_id)
+            return self._sessions[call_id]
+
+    async def remove(self, call_id: str) -> None:
+        async with self._lock:
+            session = self._sessions.pop(call_id, None)
             if session:
-                session.operator_ws = None
-                logger.info(f"🎧❌ Operator disconnected: {call_id}")
-    
-    def disconnect_scammer(self, ws: WebSocket):
-        """Handle scammer disconnect."""
-        call_id = self.scammer_to_call.pop(ws, None)
-        if call_id:
-            session = self.sessions.get(call_id)
-            if session:
-                session.scammer_ws = None
-                logger.info(f"📱❌ Scammer disconnected: {call_id}")
-    
-    async def send_to_operator(self, call_id: str, data: dict):
-        """Send message to operator."""
-        session = self.sessions.get(call_id)
-        if session and session.operator_ws:
-            try:
-                await session.operator_ws.send_json(data)
-            except Exception as e:
-                logger.error(f"Error sending to operator: {e}")
-    
-    async def send_to_scammer(self, call_id: str, data: dict):
-        """Send message to scammer."""
-        session = self.sessions.get(call_id)
-        if session and session.scammer_ws:
-            try:
-                await session.scammer_ws.send_json(data)
-            except Exception as e:
-                logger.error(f"Error sending to scammer: {e}")
-    
-    async def route_audio_to_scammer(self, call_id: str, audio_base64: str, format: str = "webm"):
-        """Route operator's audio to scammer (with conversion to playable format)."""
-        session = self.sessions.get(call_id)
-        if not session:
-            return
-        
-        try:
-            # Decode and normalize audio to make it playable
-            audio_bytes = base64.b64decode(audio_base64)
-            normalized = session.normalizer.normalize_chunk(audio_bytes, source_format=format)
-            
-            if normalized:
-                # Re-encode to base64 and send as WAV (more compatible)
-                normalized_base64 = base64.b64encode(normalized).decode('utf-8')
-                await self.send_to_scammer(call_id, {
-                    "type": "audio_stream",
-                    "audio": normalized_base64,
-                    "format": "wav",  # Normalized audio is WAV format
-                    "source": "operator",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            else:
-                # Skip if normalization failed (incomplete chunk)
-                logger.debug(f"Skipped audio routing (normalization failed)")
-        except Exception as e:
-            logger.error(f"Audio routing error: {e}")
-    
-    async def route_audio_to_operator(self, call_id: str, audio_base64: str, format: str = "webm"):
-        """Route scammer's audio to operator (with conversion to playable format)."""
-        session = self.sessions.get(call_id)
-        if not session:
-            return
-        
-        try:
-            # Decode and normalize audio to make it playable
-            audio_bytes = base64.b64decode(audio_base64)
-            normalized = session.normalizer.normalize_chunk(audio_bytes, source_format=format)
-            
-            if normalized:
-                # Re-encode to base64 and send as WAV (more compatible)
-                normalized_base64 = base64.b64encode(normalized).decode('utf-8')
-                await self.send_to_operator(call_id, {
-                    "type": "audio_stream",
-                    "audio": normalized_base64,
-                    "format": "wav",  # Normalized audio is WAV format
-                    "source": "scammer",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            else:
-                # Skip if normalization failed (incomplete chunk)
-                logger.debug(f"Skipped audio routing (normalization failed)")
-        except Exception as e:
-            logger.error(f"Audio routing error: {e}")
-    
-    async def cleanup_session(self, call_id: str):
-        """Clean up ended call session."""
-        session = self.sessions.pop(call_id, None)
-        if session:
-            await session.close_all()
-            logger.info(f"🧹 Call session cleaned up: {call_id}")
+                await session.close_all()
+
+    def get(self, call_id: str) -> Optional[CallSession]:
+        return self._sessions.get(call_id)
 
 
 call_manager = CallManager()
 
 
-# ── REST Endpoints ────────────────────────────────────────────
+async def _process_transcription(
+    session: CallSession,
+    speaker: str,
+    raw_audio: bytes,
+    audio_fmt: str,
+) -> Optional[str]:
+    buf = session.operator_buf if speaker == "operator" else session.scammer_buf
+    pcm = normalize_audio(raw_audio, fmt=audio_fmt)
+    buf.add(pcm)
 
-class StartCallRequest(BaseModel):
-    operator_name: Optional[str] = "Operator"
-    metadata: Optional[dict] = {}
+    if not buf.ready():
+        return None
 
-class StartCallResponse(BaseModel):
-    call_id: str
-    operator_link: str
-    scammer_link: str
-    status: str
-
-@router.post("/call/start", response_model=StartCallResponse)
-async def start_call(
-    request: StartCallRequest,
-    api_key: str = Depends(verify_api_key)
-):
-    """
-    Initialize a new call session.
-    Returns links for both operator and scammer to join.
-    """
-    call_id = f"call-{uuid.uuid4().hex[:12]}"
-    
-    # Create session in manager
-    session = call_manager.create_session(call_id)
-    
-    # Save to database
-    await db.live_calls.insert_one({
-        "call_id": call_id,
-        "operator_name": request.operator_name,
-        "metadata": request.metadata,
-        "status": "waiting",
-        "start_time": datetime.utcnow(),
-        "transcript": [],
-        "entities": [],
-        "threat_level": 0.0
-    })
-    
-    return StartCallResponse(
-        call_id=call_id,
-        operator_link=f"/api/call/connect?call_id={call_id}&role=operator",
-        scammer_link=f"/api/call/connect?call_id={call_id}&role=scammer",
-        status="ready"
-    )
-
-
-@router.post("/call/end/{call_id}")
-async def end_call(
-    call_id: str,
-    api_key: str = Depends(verify_api_key)
-):
-    """End an active call and generate report."""
-    session = call_manager.get_session(call_id)
-    if not session:
-        raise HTTPException(404, "Call not found")
-    
-    # Mark as ended
-    session.is_active = False
-    
-    # Update database
-    await db.live_calls.update_one(
-        {"call_id": call_id},
-        {
-            "$set": {
-                "status": "ended",
-                "end_time": datetime.utcnow(),
-                "transcript": session.transcript,
-                "entities": session.entities,
-                "threat_level": session.threat_level,
-                "tactics": session.tactics
+    flushed = buf.flush()
+    try:
+        result = await transcribe_bytes(flushed, fmt="wav")
+        text = result.get("text", "").strip()
+        if text:
+            entry = {
+                "speaker": speaker,
+                "text": text,
+                "language": result.get("language", "en"),
+                "confidence": result.get("confidence", 0.95),
+                "timestamp": datetime.utcnow().isoformat(),
             }
-        }
+            session.transcript.append(entry)
+            session.turn_count += 1
+            return text
+    except Exception as e:
+        logger.error("Transcription error for %s: %s", speaker, e)
+
+    return None
+
+
+async def _run_ai_pipeline(session: CallSession, scammer_text: str) -> None:
+    intel_task = asyncio.create_task(
+        asyncio.to_thread(extract_entities, scammer_text)
     )
-    
-    # Notify both participants
-    await call_manager.send_to_operator(call_id, {"type": "call_ended"})
-    await call_manager.send_to_scammer(call_id, {"type": "call_ended"})
-    
-    # Cleanup
-    await call_manager.cleanup_session(call_id)
-    
-    return {"status": "ended", "call_id": call_id}
+    agent_task = asyncio.create_task(
+        run_agent(
+            scammer_text=scammer_text,
+            history=session.transcript[-6:],
+            mode="ai_coached",
+            turn_count=session.turn_count,
+        )
+    )
+
+    intel_result, agent_result = await asyncio.gather(
+        intel_task, agent_task, return_exceptions=True
+    )
+
+    if isinstance(intel_result, dict):
+        await session.send_operator({
+            "type": "intelligence",
+            "entities":    intel_result.get("entities", []),
+            "threat_level": intel_result.get("threat_level", 0),
+            "tactics":     intel_result.get("tactics", []),
+            "timestamp":   datetime.utcnow().isoformat(),
+        })
+
+    if isinstance(agent_result, dict) and agent_result.get("coaching_text"):
+        coaching_text = agent_result["coaching_text"]
+
+        coaching_audio_b64: Optional[str] = None
+        try:
+            audio_bytes = await synthesize_to_bytes(coaching_text)
+            coaching_audio_b64 = base64.b64encode(audio_bytes).decode()
+        except Exception as e:
+            logger.warning("TTS failed for coaching: %s", e)
+
+        await session.send_operator({
+            "type":          "ai_coaching",
+            "text":          coaching_text,
+            "audio":         coaching_audio_b64,
+            "scripts":       agent_result.get("coaching_scripts", []),
+            "strategy":      agent_result.get("strategy", "empathy"),
+            "intent":        agent_result.get("intent", "unknown"),
+            "timestamp":     datetime.utcnow().isoformat(),
+        })
 
 
-@router.get("/call/report/{call_id}")
-async def get_call_report(
-    call_id: str,
-    format: str = "json",
-    api_key: str = Depends(verify_api_key)
-):
-    """Generate detailed report from call session."""
-    call_data = await db.live_calls.find_one({"call_id": call_id})
-    if not call_data:
-        raise HTTPException(404, "Call not found")
-    
-    if format == "pdf":
-        # Generate PDF report
-        pdf_result = await report_generator.generate_report(session_id=call_id, format="pdf")
-        
-        from fastapi.responses import FileResponse
-        if pdf_result.get("file_path"):
-            return FileResponse(
-                pdf_result["file_path"],
-                media_type="application/pdf",
-                filename=f"call_report_{call_id}.pdf"
-            )
-        else:
-            # Fallback to JSON if PDF failed
-            return pdf_result
-    
-    # Return JSON report
-    return {
-        "call_id": call_id,
-        "status": call_data.get("status"),
-        "duration": (call_data.get("end_time", datetime.utcnow()) - call_data["start_time"]).total_seconds(),
-        "transcript": call_data.get("transcript", []),
-        "entities": call_data.get("entities", []),
-        "threat_level": call_data.get("threat_level", 0),
-        "tactics": call_data.get("tactics", []),
-        "summary": f"Call involved {len(call_data.get('transcript', []))} messages"
-    }
-
-
-# ── WebSocket Endpoints ───────────────────────────────────────
-
-@router.websocket("/call/connect")
-async def websocket_call_endpoint(
+@router.websocket("/ws/{call_id}")
+async def live_call_ws(
     websocket: WebSocket,
     call_id: str,
-    role: str  # "operator" or "scammer"
+    role: str = Query(..., pattern="^(operator|scammer)$"),
 ):
-    """
-    WebSocket endpoint for real-time two-way voice calls.
-    
-    Messages from client:
-        {"type": "audio_chunk", "audio": "<base64>", "format": "webm"}
-        {"type": "text_message", "text": "..."} (chat fallback)
-        {"type": "ping"}
-    
-    Messages to operator:
-        {"type": "audio_stream", "audio": "<base64>", "source": "scammer"}
-        {"type": "transcription", "text": "...", "speaker": "scammer", "language": "en"}
-        {"type": "ai_coaching", "suggestions": [...]}
-        {"type": "intelligence_update", "entities": [...], "threat_level": 0.7}
-        {"type": "participant_joined", "role": "scammer"}
-        {"type": "call_ended"}
-    
-    Messages to scammer:
-        {"type": "audio_stream", "audio": "<base64>", "source": "operator"}
-        {"type": "call_ended"}
-    """
-    
-    if role not in ["operator", "scammer"]:
-        await websocket.close(code=4000, reason="Invalid role")
-        return
-    
-    # Connect based on role
+    await websocket.accept()
+    session = await call_manager.get_or_create(call_id)
+
+    if role == "operator":
+        session.operator_ws = websocket
+    else:
+        session.scammer_ws = websocket
+
+    logger.info("CALL %s: %s connected", call_id, role)
+
+    await websocket.send_json({
+        "type":      "connected",
+        "role":      role,
+        "call_id":   call_id,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    if session.both_connected:
+        await session.broadcast({
+            "type":    "participant_joined",
+            "message": "Both participants connected. Call is live.",
+        })
+
     try:
-        if role == "operator":
-            session = await call_manager.connect_operator(call_id, websocket)
-        else:
-            session = await call_manager.connect_scammer(call_id, websocket)
-        
-        # Main message loop
         while session.is_active:
             try:
-                data = await websocket.receive_json()
-                await handle_call_message(call_id, role, data, session)
-            
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected: {role} in {call_id}")
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error ({role}): {e}", exc_info=True)
-                await websocket.send_json({
-                    "type": "error",
-                    "message": str(e)
-                })
-    
-    finally:
-        # Cleanup on disconnect
-        if role == "operator":
-            call_manager.disconnect_operator(websocket)
-            # Notify scammer
-            await call_manager.send_to_scammer(call_id, {
-                "type": "participant_left",
-                "role": "operator"
-            })
-        else:
-            call_manager.disconnect_scammer(websocket)
-            # Notify operator
-            await call_manager.send_to_operator(call_id, {
-                "type": "participant_left",
-                "role": "scammer"
-            })
-
-
-async def handle_call_message(call_id: str, role: str, data: dict, session: CallSession):
-    """Handle incoming WebSocket message."""
-    msg_type = data.get("type")
-    
-    if msg_type == "audio_chunk":
-        await handle_audio_chunk(call_id, role, data, session)
-    
-    elif msg_type == "text_message":
-        await handle_text_message(call_id, role, data, session)
-    
-    elif msg_type == "ping":
-        # Respond with pong
-        if role == "operator":
-            await call_manager.send_to_operator(call_id, {"type": "pong"})
-        else:
-            await call_manager.send_to_scammer(call_id, {"type": "pong"})
-    
-    elif msg_type == "request_coaching":
-        # Operator requests AI coaching based on current context
-        if role == "operator":
-            await provide_ai_coaching(call_id, session)
-
-
-async def handle_audio_chunk(call_id: str, role: str, data: dict, session: CallSession):
-    """
-    Handle audio chunk from participant.
-    1. Route audio to other participant
-    2. Transcribe (for intelligence if from scammer, for transcript if from operator)
-    3. Extract intelligence if from scammer
-    4. Provide AI coaching if from scammer (to help operator)
-    """
-    audio_base64 = data.get("audio", "")
-    audio_format = data.get("format", "webm")
-    
-    if not audio_base64:
-        return
-    
-    # 1. Route audio to other participant
-    if role == "operator":
-        # Operator speaking → send to scammer
-        await call_manager.route_audio_to_scammer(call_id, audio_base64, audio_format)
-    else:
-        # Scammer speaking → send to operator
-        await call_manager.route_audio_to_operator(call_id, audio_base64, audio_format)
-    
-    # 2. Transcribe audio (async background)
-    asyncio.create_task(transcribe_and_analyze(call_id, role, audio_base64, audio_format, session))
-
-
-async def transcribe_and_analyze(call_id: str, role: str, audio_base64: str, audio_format: str, session: CallSession):
-    """
-    Background task: Transcribe audio and analyze intelligence.
-    """
-    try:
-        # Decode audio
-        audio_bytes = base64.b64decode(audio_base64)
-        
-        # Normalize audio chunk
-        normalized = session.normalizer.normalize_chunk(audio_bytes, source_format=audio_format)
-        
-        # Skip if normalization failed (common for streaming WebM chunks)
-        if normalized is None:
-            return
-        
-        # Transcribe
-        transcriber = session.scammer_transcriber if role == "scammer" else session.operator_transcriber
-        is_ready = transcriber.add_chunk(normalized)
-        
-        if is_ready:
-            result = await transcriber.transcribe_buffer()
-            
-            if result and result.get("text"):
-                transcription = {
-                    "speaker": role,
-                    "text": result["text"],
-                    "language": result.get("language", "en"),
-                    "confidence": result.get("confidence", 0.0),
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                
-                # Add to transcript
-                session.transcript.append(transcription)
-                
-                # Send transcription to operator
-                await call_manager.send_to_operator(call_id, {
-                    "type": "transcription",
-                    **transcription
-                })
-                
-                # Save to database
-                await db.live_calls.update_one(
-                    {"call_id": call_id},
-                    {"$push": {"transcript": transcription}}
+                msg = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=30.0
                 )
-                
-                # If scammer is speaking, extract intelligence and provide AI coaching
-                if role == "scammer":
-                    await extract_intelligence(call_id, result["text"], session)
-                    await provide_ai_coaching(call_id, session)
-    
-    except Exception as e:
-        logger.error(f"Transcription error: {e}", exc_info=True)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+                continue
 
+            msg_type = msg.get("type")
 
-async def extract_intelligence(call_id: str, text: str, session: CallSession):
-    """Extract intelligence from scammer's speech."""
-    try:
-        # Use intelligence pipeline to extract entities
-        intel_result = await intelligence_pipeline.process_transcript(
-            session_id=call_id,
-            text=text,
-            speaker="scammer"
-        )
-        
-        if intel_result.get("new_entities"):
-            new_entities = intel_result["new_entities"]
-            session.entities.extend(new_entities)
-            
-            # Get threat level from result
-            threat_level = intel_result.get("threat_level", 0.0)
-            session.threat_level = threat_level
-            
-            # Detect tactics
-            if intel_result.get("tactics"):
-                session.tactics.extend(intel_result["tactics"])
-            
-            # Send intelligence update to operator
-            await call_manager.send_to_operator(call_id, {
-                "type": "intelligence_update",
-                "entities": new_entities,
-                "threat_level": threat_level,
-                "tactics": intel_result.get("tactics", []),
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            
-            # Update database
-            await db.live_calls.update_one(
-                {"call_id": call_id},
-                {
-                    "$set": {
-                        "entities": session.entities,
-                        "threat_level": session.threat_level,
-                        "tactics": session.tactics
-                    }
-                }
-            )
-    
-    except Exception as e:
-        logger.error(f"Intelligence extraction error: {e}", exc_info=True)
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
 
-
-async def provide_ai_coaching(call_id: str, session: CallSession):
-    """
-    Generate AI response and send audio to scammer (AI speaks to scammer).
-    Also notify operator of what AI said (text-only monitoring).
-    """
-    try:
-        # Get recent conversation context
-        recent_transcript = session.transcript[-10:] if len(session.transcript) > 10 else session.transcript
-        
-        # Format conversation for AI
-        conversation = "\n".join([
-            f"{msg['speaker']}: {msg['text']}"
-            for msg in recent_transcript
-        ])
-        
-        # Get AI response from takeover agent
-        coaching = await takeover_agent.get_coaching_suggestions(
-            conversation=conversation,
-            entities=session.entities,
-            threat_level=session.threat_level,
-            tactics=session.tactics
-        )
-        
-        # Extract AI response text (what AI will say to scammer)
-        ai_response_text = coaching.get("recommended_response", "")
-        
-        if not ai_response_text:
-            logger.warning("[AI TAKEOVER] No response text generated, skipping TTS")
-            return
-        
-        # Step 1 — Synthesize AI voice
-        audio_base64 = None
-        try:
-            from config import settings
-            voice_id = getattr(settings, 'ELEVENLABS_VOICE_ID', None)
-            
-            logger.info(f"[AI TAKEOVER] Generating voice for scammer: '{ai_response_text[:80]}...'")
-            audio_bytes = await tts_service.synthesize_to_bytes(
-                text=ai_response_text,
-                voice_id=voice_id
-            )
-            
-            if audio_bytes:
-                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-                logger.info(f"[AI TAKEOVER] TTS synthesized {len(audio_bytes)} bytes for scammer")
-            else:
-                logger.warning("[AI TAKEOVER] synthesize_to_bytes returned None")
-                
-        except Exception as e:
-            logger.error(f"[AI TAKEOVER] TTS failed: {e}", exc_info=True)
-        
-        # Step 2 — Send AI voice audio to SCAMMER so they hear it
-        if audio_base64 and session.scammer_ws:
-            try:
-                await session.scammer_ws.send_json({
-                    "type": "audio",               # same type as regular audio relay
-                    "data": audio_base64,          # scammer frontend plays this like operator audio
-                    "from": "ai",                  # identifies source as AI not operator
-                    "format": "mp3",
-                    "timestamp": datetime.utcnow().isoformat()
+            if msg_type == "end_call":
+                await session.broadcast({
+                    "type":      "call_ended",
+                    "reason":    "user_request",
+                    "duration":  (datetime.utcnow() - session.created_at).seconds,
+                    "timestamp": datetime.utcnow().isoformat(),
                 })
-                logger.info("[AI TAKEOVER] AI audio sent to scammer successfully")
-            except Exception as e:
-                logger.error(f"[AI TAKEOVER] Failed to send audio to scammer: {e}")
-        
-        # Step 3 — Notify OPERATOR what the AI said (text only, no audio — operator monitors silently)
-        if session.operator_ws:
-            try:
-                await session.operator_ws.send_json({
-                    "type": "ai_response_sent",    # NEW event type — operator sees transcript only
-                    "text": ai_response_text,
-                    "strategy": coaching.get("strategy", ""),
-                    "intent": coaching.get("intent", ""),
-                    "confidence": coaching.get("confidence", 0.0),
-                    "reasoning": coaching.get("reasoning", ""),
-                    "threat_level": session.threat_level,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                logger.info("[AI TAKEOVER] Operator notified of AI response (text-only)")
-            except Exception as e:
-                logger.error(f"[AI TAKEOVER] Failed to notify operator: {e}")
-        
-        # Step 4 — Also append AI response to session transcript
-        session.transcript.append({
-            "speaker": "ai",
-            "text": ai_response_text,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
+                await call_manager.remove(call_id)
+                return
+
+            if msg_type == "audio":
+                raw_b64 = msg.get("data", "")
+                audio_fmt = msg.get("format", "webm")
+                if not raw_b64:
+                    continue
+
+                try:
+                    raw_bytes = base64.b64decode(raw_b64)
+                except Exception:
+                    continue
+
+                relay_target = session.scammer_ws if role == "operator" else session.operator_ws
+                if relay_target:
+                    asyncio.create_task(relay_target.send_json({
+                        "type":      "audio",
+                        "data":      raw_b64,
+                        "from":      role,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }))
+
+                async def _transcribe_and_notify(
+                    _raw=raw_bytes, _fmt=audio_fmt, _role=role
+                ):
+                    text = await _process_transcription(session, _role, _raw, _fmt)
+                    if text:
+                        await session.broadcast({
+                            "type":      "transcription",
+                            "speaker":   _role,
+                            "text":      text,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        })
+                        if _role == "scammer" and session.both_connected:
+                            asyncio.create_task(_run_ai_pipeline(session, text))
+
+                asyncio.create_task(_transcribe_and_notify())
+
+    except WebSocketDisconnect:
+        logger.info("CALL %s: %s disconnected", call_id, role)
     except Exception as e:
-        logger.error(f"[AI TAKEOVER] Error in provide_ai_coaching: {e}", exc_info=True)
+        logger.error("CALL %s: %s error: %s", call_id, role, e)
+    finally:
+        if role == "operator":
+            session.operator_ws = None
+        else:
+            session.scammer_ws = None
+
+        async def _deferred_cleanup():
+            await asyncio.sleep(60)
+            s = call_manager.get(call_id)
+            if s and not s.both_connected:
+                logger.info("CALL %s: cleaning up abandoned session", call_id)
+                await call_manager.remove(call_id)
+
+        asyncio.create_task(_deferred_cleanup())
 
 
-async def handle_text_message(call_id: str, role: str, data: dict, session: CallSession):
-    """Handle text-based message (chat fallback)."""
-    text = data.get("text", "")
-    if not text:
-        return
-    
-    message = {
-        "speaker": role,
-        "text": text,
-        "type": "text",
-        "timestamp": datetime.utcnow().isoformat()
+class StartCallRequest(BaseModel):
+    call_id: Optional[str] = None
+
+
+@router.post("/start")
+async def start_call(req: StartCallRequest):
+    call_id = req.call_id or str(uuid.uuid4())
+    await call_manager.get_or_create(call_id)
+    return {
+        "call_id": call_id,
+        "operator_url": f"/api/live-call/ws/{call_id}?role=operator",
+        "scammer_url":  f"/api/live-call/ws/{call_id}?role=scammer",
     }
-    
-    session.transcript.append(message)
-    
-    # Notify other participant
-    if role == "operator":
-        await call_manager.send_to_scammer(call_id, {
-            "type": "text_message",
-            "text": text,
-            "from": "operator"
-        })
-    else:
-        await call_manager.send_to_operator(call_id, {
-            "type": "text_message",
-            "text": text,
-            "from": "scammer"
-        })
-        
-        # Extract intelligence from scammer's text
-        await extract_intelligence(call_id, text, session)
-        await provide_ai_coaching(call_id, session)
+
+
+@router.get("/status/{call_id}")
+async def call_status(call_id: str):
+    session = call_manager.get(call_id)
+    if not session:
+        return {"status": "not_found"}
+    return {
+        "call_id":           call_id,
+        "is_active":         session.is_active,
+        "operator_connected": session.operator_ws is not None,
+        "scammer_connected":  session.scammer_ws is not None,
+        "turn_count":        session.turn_count,
+        "created_at":        session.created_at.isoformat(),
+    }
+
+
+@router.post("/end/{call_id}")
+async def end_call(call_id: str):
+    session = call_manager.get(call_id)
+    if session:
+        await session.broadcast({"type": "call_ended", "reason": "api_request"})
+        await call_manager.remove(call_id)
+    return {"status": "ended", "call_id": call_id}

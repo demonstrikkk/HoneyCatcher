@@ -1,66 +1,43 @@
-import os
-import logging
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
-import asyncio
 from config import settings
+import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("db")
+logger = logging.getLogger(__name__)
 
-class MongoDB:
-    client: AsyncIOMotorClient = None
-    db = None
+_client: AsyncIOMotorClient | None = None
 
-    @classmethod
-    async def connect(cls):
-        """
-        Connect to MongoDB with retry logic.
-        """
-        uri = settings.MONGO_URI
-        db_name = settings.DB_NAME
-        
-        retries = 3
-        delay = 2
 
-        for attempt in range(retries):
-            try:
-                logger.info(f"Connecting to MongoDB at {uri} (Attempt {attempt + 1}/{retries})...")
-                cls.client = AsyncIOMotorClient(
-                    uri,
-                    serverSelectionTimeoutMS=5000
-                )
-                # Verify connection
-                await cls.client.admin.command('ping')
-                cls.db = cls.client[db_name]
-                logger.info("✅ Connected to MongoDB.")
-                return
-            except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-                logger.error(f"❌ MongoDB Connection failed: {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(delay)
-                    delay *= 2  # Exponential backoff
-                else:
-                    logger.critical("🚨 Could not connect to MongoDB after multiple attempts.")
-                    raise e
+async def connect_db():
+    global _client
+    _client = AsyncIOMotorClient(
+        settings.MONGODB_URI,
+        maxPoolSize=100,
+        minPoolSize=10,
+        serverSelectionTimeoutMS=5000,
+    )
+    logger.info("MongoDB connected")
 
-    @classmethod
-    async def close(cls):
-        """Close MongoDB connection."""
-        if cls.client:
-            cls.client.close()
-            logger.info("MongoDB connection closed.")
+
+async def close_db():
+    global _client
+    if _client:
+        _client.close()
+        logger.info("MongoDB disconnected")
+
+
+def get_db():
+    return _client[settings.MONGODB_DATABASE]
+
+
+def get_collection(name: str):
+    return get_db()[name]
+
 
 class DatabaseProxy:
-    """
-    Proxy to the MongoDB database instance.
-    This allows importing 'db' at module level before it's initialized.
-    """
     def __getattr__(self, name):
-        if MongoDB.db is None:
+        if _client is None:
             raise RuntimeError("MongoDB not initialized. Check logs for connection errors.")
-        return getattr(MongoDB.db, name)
+        return getattr(get_db(), name)
 
-# Global DB instance proxy
+
 db = DatabaseProxy()
